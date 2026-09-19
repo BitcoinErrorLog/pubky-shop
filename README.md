@@ -146,26 +146,71 @@ row hashes, actions, generated listing ids, and deterministic idempotency
 keys. The JSONL manifest is streamed to an fsynced temporary file and
 atomically renamed. `loadSummary` and `streamRows` avoid materialization;
 `load` and `planImport(bytes, ...)` are explicitly bounded convenience APIs.
-Generated ids are persisted before a future publisher may act.
+`streamRows` validates the complete file and trailing row count before it
+yields any authoritative row. `checkpointImportRow` performs a bounded
+streaming atomic rewrite, and `streamResumeTasks` resumes catalogs of any row
+count without calling `load`. Generated ids are persisted before a future
+publisher may act.
 
 `FileManifestStore` is the production host-supplied adapter included in this
-package. It uses mode-0600 files in a mode-0700 directory, an inter-process
-exclusive lock, version compare-and-swap, fsync, and atomic rename. The
-adapter refuses a symlinked or group/world-accessible storage directory
-instead of silently weakening host persistence security. Per-row checkpoints
-are `planned`, `publishing`, `published_unsynced`, `complete`, `conflict`, and
-`failed`. Restart maps an uncertain `publishing` row to `reconcile_publish`,
-never a blind repeat; `published_unsynced` resumes only the service-sync leg.
+package. It canonicalizes the configured root once, pins its device, inode,
+and mode, and verifies that identity before and after lock, manifest, spool,
+quarantine, and cleanup operations. Final opens use no-follow flags where Node
+exposes them; files are mode 0600, the root and planning directories are mode
+0700, and writes use inter-process exclusion, fsync, and atomic rename or
+append.
+
+This is deliberately not an `openat` confinement claim: Node has no
+directory-relative no-follow API. The host configuration and the canonical
+root's parent are trusted and must not be concurrently renameable by an
+attacker. Detected root replacement fails closed, but a privileged
+parent-directory attacker racing the unavoidable check/open gap is outside the
+adapter's threat model. A symlink in a trusted parent is canonicalized; a
+symlink as the configured final root or a managed final file is refused.
+Abandoned dead-process `.planning` and `.tmp` artifacts are reaped only after
+the configured age, while live-PID, young, changed-identity, and unknown files
+are retained.
+
+Per-row checkpoints are `planned`, `publishing`, `published_unsynced`,
+`complete`, `conflict`, and `failed`. Restart maps an uncertain `publishing`
+row to `reconcile_publish`, never a blind repeat; `published_unsynced` resumes
+only the service-sync leg.
 
 `replayImport` returns the existing manifest for identical row identities and
 hashes. Changed content is recorded in a separate immutable
 `pubky-shop-replay-quarantine` JSONL log with its own monotonic version and a
-compare-and-append check against both manifest and quarantine versions.
-Replay never changes `complete`, `conflict`, `failed`, or any other row
-checkpoint. Quarantine reports survive a new `FileManifestStore` instance.
-Malformed or truncated CSV creates no manifest. Wave 2 has no homeserver PUT,
-fake compare-and-swap, service publication, connector, CLI, webhook, payment,
-or UI surface.
+compare-and-append check against the manifest version. Identity is
+`SHA-256(manifest schema/version, replay source SHA-256, canonical conflict
+hash)`: sequential, concurrent, and post-restart duplicate replays return the
+existing durable record without adding a version. Metadata records are bounded
+and appended with `O_APPEND`; conflict rows live in an immutable,
+content-verified JSONL sidecar and are read with `streamReplayConflicts`.
+Neither append nor read rewrites or materializes prior history.
+
+D6.19 retention is host-operated: retain manifest/result and quarantine files
+for at least 30 days, then call `compactReplayQuarantines` with the retention
+cutoff. Compaction is the explicit bounded streaming maintenance operation;
+after an identity ages out, a later replay may create a new audit record.
+Storage is therefore bounded by the host's retained replay volume, not by an
+unsafe in-process cap. A truncated quarantine tail fails closed until the host
+calls `repairReplayQuarantineTail`, which validates every complete record and
+removes only the incomplete final fragment. `discardManifest` is the
+version-CAS discard control; it makes the manifest unavailable first, then
+removes its retained quarantine/conflict files. Replay never changes
+`complete`, `conflict`, `failed`, or any other row checkpoint. Quarantine
+reports survive a new `FileManifestStore` instance. Malformed or truncated CSV
+creates no manifest. Wave 2 has no homeserver PUT, fake compare-and-swap,
+service publication, connector, CLI, webhook, payment, or UI surface.
+
+External grouping retains only one fixed fan-in batch. Generated runs use
+deterministic generation/index names rather than an in-memory path catalog.
+The byte budget charges each input's fixed 64 KiB stream/readline/decoder
+overhead, line head, iterator, pathname, and output metadata; fan-in is the
+minimum allowed by that budget and the explicit descriptor cap
+(`maxSortOpenFiles`, default 16). Reported resource usage includes both the
+configured cap and measured descriptor/metadata/working-set high-water marks.
+A configuration that cannot support a two-way merge is rejected before
+reading input.
 
 ## Safe errors and limits
 
