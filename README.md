@@ -36,9 +36,19 @@ from any homeserver credential.
 
 `getInventoryProjection(aggregateId)` and `adjustInventory(request)` return
 `SdkResult<T>`. They decode the generated Wave 1 contract while preserving
-unknown response fields for forward compatibility. Response bodies are
-bounded, integer values must be safe JavaScript integers, server messages are
-never reflected, and only allowlisted service error codes are exposed.
+unknown response fields for forward compatibility. Wave 1 Rust `i64` fields
+(`server_revision` and every stock quantity) are exposed consistently as
+`bigint`, including ordinary small values. Integer JSON tokens are captured
+before JavaScript `Number` conversion, values outside the signed 64-bit range
+and non-integer tokens fail with `invalid_response`, and unknown integer fields
+are also retained losslessly as `bigint`.
+
+`InventoryAdjustRequest.expected_revision` and `delta` are `bigint`. The SDK
+serializes them as exact unquoted JSON integer tokens; for example
+`expected_revision: 9007199254740992n` sends
+`"expected_revision":9007199254740992`. Response bodies remain bounded,
+server messages are never reflected, and only allowlisted service error codes
+are exposed.
 
 The projection's `stock.authority` is always `listing_total`. Variant id and
 SKU are catalog lookup assertions only. This package does not claim or expose
@@ -75,11 +85,21 @@ the explicit Excel option emits one. Dangerous spreadsheet prefixes
 (`=`, `+`, `-`, `@`) and leading apostrophes use a reversible apostrophe
 escape.
 
-`parseCanonicalCsv(bytes)` accepts BOM or no BOM and rejects lone LF/CR,
-truncated quotes, duplicate headers/rows/variant ids, ambiguous SKUs,
-conflicting listing fields, raw formula payloads, invalid identity/mapping,
-unsafe integers, and over-limit input. Unknown extra columns are retained in
-`extraFields` and exported deterministically.
+`parseCanonicalCsvStream(source, onRow, limits)` is the unbounded-catalog byte
+API. `source` may be an `AsyncIterable<Uint8Array>`, a
+`ReadableStream<Uint8Array>`, or a synchronous iterable. It incrementally
+hashes source bytes, decodes UTF-8, recognizes a BOM even when its three bytes
+arrive separately, and preserves RFC 4180 state across chunk-split CRLF,
+escaped quotes, and multibyte characters. It retains only the current bounded
+row/cell and reports measured peak parser-owned bytes. Cross-row duplicate and
+listing-group validation is performed by `planImportStream` before commit.
+
+`parseCanonicalCsv(bytes)` is the bounded, materializing convenience codec. It
+accepts BOM or no BOM and rejects lone LF/CR, truncated quotes, duplicate
+headers/rows/variant ids, ambiguous SKUs, conflicting listing fields, raw
+formula payloads, invalid identity/mapping, unsafe integers, and over-limit
+input. Unknown extra columns are retained in `extraFields` and exported
+deterministically.
 
 Canonical columns are:
 
@@ -92,28 +112,41 @@ Canonical columns are:
 
 Identity comes only from `record_uri`, `(seller_pubky, listing_id)`, or an
 explicit `source_listing_key` for a new record. Title is never identity.
-Nested JSON, byte, row, column, cell, depth, and working-set limits are
-configurable and fail with typed safe observed values.
+Streaming input has no fixed total-byte or total-row cap. Row bytes, cell
+bytes, columns, nested JSON depth, and parser/planner working sets are bounded
+and fail with typed safe observed values. The byte-array convenience parser
+and exporter additionally retain explicit total byte/row caps.
 
 ## Durable import planning
 
 ```ts
 import {
   FileManifestStore,
-  planImport,
+  planImportStream,
   replayImport,
   resumeTasks,
 } from "@bitcoinerrorlog/pubky-shop";
 
 const store = new FileManifestStore("/secure/host-owned/import-manifests");
-const planned = await planImport(csvBytes, { store });
+const planned = await planImportStream(fileReadable, { store });
 ```
 
-Planning parses and validates the complete source before the first durable
-write and performs no remote write. A manifest fixes its id, exact source
-SHA-256, parser/mapping/schema versions, complete row identities, normalized
+Planning incrementally writes a mode-0600 spool and external grouping indexes
+inside the host-provided manifest directory. Bounded external merge sorts
+validate duplicate rows, variant identities, SKUs, and listing-level facts
+without retaining decoded source or all rows in process memory. The first
+committed manifest write occurs only after EOF, UTF-8/CSV/mapping validation,
+external grouping, generated-id collision checks, and source SHA-256
+completion. Malformed late input removes the planning spool and leaves no
+manifest.
+
+A manifest fixes its id, exact source SHA-256 and decimal source-byte count,
+parser/mapping/schema versions, complete immutable row identities, normalized
 row hashes, actions, generated listing ids, and deterministic idempotency
-keys. Generated ids are persisted before a future publisher may act.
+keys. The JSONL manifest is streamed to an fsynced temporary file and
+atomically renamed. `loadSummary` and `streamRows` avoid materialization;
+`load` and `planImport(bytes, ...)` are explicitly bounded convenience APIs.
+Generated ids are persisted before a future publisher may act.
 
 `FileManifestStore` is the production host-supplied adapter included in this
 package. It uses mode-0600 files in a mode-0700 directory, an inter-process
@@ -125,10 +158,14 @@ are `planned`, `publishing`, `published_unsynced`, `complete`, `conflict`, and
 never a blind repeat; `published_unsynced` resumes only the service-sync leg.
 
 `replayImport` returns the existing manifest for identical row identities and
-hashes. Same identity with changed content is atomically quarantined with a
-row conflict report. Malformed or truncated CSV creates no manifest. Wave 2
-has no homeserver PUT, fake compare-and-swap, service publication, connector,
-CLI, webhook, payment, or UI surface.
+hashes. Changed content is recorded in a separate immutable
+`pubky-shop-replay-quarantine` JSONL log with its own monotonic version and a
+compare-and-append check against both manifest and quarantine versions.
+Replay never changes `complete`, `conflict`, `failed`, or any other row
+checkpoint. Quarantine reports survive a new `FileManifestStore` instance.
+Malformed or truncated CSV creates no manifest. Wave 2 has no homeserver PUT,
+fake compare-and-swap, service publication, connector, CLI, webhook, payment,
+or UI surface.
 
 ## Safe errors and limits
 

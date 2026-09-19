@@ -6,7 +6,12 @@ import {
   err,
   ok,
 } from "./errors.js";
-import { type JsonObject, type JsonValue, canonicalJson, parseBoundedJson } from "./json.js";
+import {
+  type LosslessJsonObject,
+  type LosslessJsonValue,
+  canonicalJsonLossless,
+  parseBoundedJsonLossless,
+} from "./json.js";
 
 export interface PubkyShopClientConfig {
   readonly session: string;
@@ -15,21 +20,23 @@ export interface PubkyShopClientConfig {
   readonly maxResponseBytes?: number;
 }
 
-export interface StockView extends JsonObject {
+export type Int64 = bigint;
+
+export interface StockView extends LosslessJsonObject {
   authority: "listing_total";
-  total: number;
-  available: number;
-  reserved: number;
-  sold: number;
+  total: Int64;
+  available: Int64;
+  reserved: Int64;
+  sold: Int64;
 }
 
-export interface InventoryProjection extends JsonObject {
-  schema_version: 1;
+export interface InventoryProjection extends LosslessJsonObject {
+  schema_version: 1n;
   kind: "inventory_projection";
   aggregate_id: string;
   seller_pubky: string;
   listing_id: string;
-  server_revision: number;
+  server_revision: Int64;
   stock: StockView;
 }
 
@@ -48,23 +55,23 @@ export interface InventoryAdjustRequest {
   readonly kind: "inventory.adjust";
   readonly aggregate_id: string;
   readonly listing_id: string;
-  readonly expected_revision: number;
-  readonly delta: number;
+  readonly expected_revision: Int64;
+  readonly delta: Int64;
   readonly idempotency_key: string;
   readonly variant?: VariantAssertion;
   readonly external_ref?: ExternalReference;
 }
 
-export interface InventoryAdjustmentResult extends JsonObject {
+export interface InventoryAdjustmentResult extends LosslessJsonObject {
   aggregate_id: string;
   listing_id: string;
-  server_revision: number;
+  server_revision: Int64;
   event_id: string;
   stock: StockView;
 }
 
-export interface InventoryAdjustmentEnvelope extends JsonObject {
-  schema_version: 1;
+export interface InventoryAdjustmentEnvelope extends LosslessJsonObject {
+  schema_version: 1n;
   ok: true;
   result: InventoryAdjustmentResult;
 }
@@ -109,30 +116,33 @@ function validateSession(session: string): void {
   }
 }
 
-function safeInteger(value: JsonValue | undefined, minimum = 0): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+const I64_MIN = -(1n << 63n);
+const I64_MAX = (1n << 63n) - 1n;
+
+function int64(value: LosslessJsonValue | undefined, minimum: bigint = I64_MIN): value is bigint {
+  return typeof value === "bigint" && value >= minimum && value <= I64_MAX;
 }
 
-function object(value: JsonValue | undefined): value is JsonObject {
+function object(value: LosslessJsonValue | undefined): value is LosslessJsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function decodeStock(value: JsonValue | undefined): StockView {
+function decodeStock(value: LosslessJsonValue | undefined): StockView {
   const combined =
     object(value) &&
-    typeof value.available === "number" &&
-    typeof value.reserved === "number" &&
-    typeof value.sold === "number"
+    typeof value.available === "bigint" &&
+    typeof value.reserved === "bigint" &&
+    typeof value.sold === "bigint"
       ? value.available + value.reserved + value.sold
-      : Number.NaN;
+      : -1n;
   if (
     !object(value) ||
     value.authority !== "listing_total" ||
-    !safeInteger(value.total) ||
-    !safeInteger(value.available) ||
-    !safeInteger(value.reserved) ||
-    !safeInteger(value.sold) ||
-    !Number.isSafeInteger(combined) ||
+    !int64(value.total, 0n) ||
+    !int64(value.available, 0n) ||
+    !int64(value.reserved, 0n) ||
+    !int64(value.sold, 0n) ||
+    combined > I64_MAX ||
     combined !== value.total
   ) {
     throw new PubkyShopError("invalid_response");
@@ -140,10 +150,10 @@ function decodeStock(value: JsonValue | undefined): StockView {
   return value as StockView;
 }
 
-export function decodeInventoryProjection(value: JsonValue): InventoryProjection {
+export function decodeInventoryProjection(value: LosslessJsonValue): InventoryProjection {
   if (
     !object(value) ||
-    value.schema_version !== 1 ||
+    value.schema_version !== 1n ||
     value.kind !== "inventory_projection" ||
     typeof value.aggregate_id !== "string" ||
     value.aggregate_id.length < 1 ||
@@ -153,7 +163,7 @@ export function decodeInventoryProjection(value: JsonValue): InventoryProjection
     typeof value.listing_id !== "string" ||
     !ID.test(value.listing_id) ||
     value.listing_id.length > 128 ||
-    !safeInteger(value.server_revision, 1)
+    !int64(value.server_revision, 1n)
   ) {
     throw new PubkyShopError("invalid_response");
   }
@@ -161,16 +171,16 @@ export function decodeInventoryProjection(value: JsonValue): InventoryProjection
   return value as InventoryProjection;
 }
 
-export function decodeInventoryAdjustment(value: JsonValue): InventoryAdjustmentEnvelope {
+export function decodeInventoryAdjustment(value: LosslessJsonValue): InventoryAdjustmentEnvelope {
   if (
     !object(value) ||
-    value.schema_version !== 1 ||
+    value.schema_version !== 1n ||
     value.ok !== true ||
     !object(value.result) ||
     typeof value.result.aggregate_id !== "string" ||
     typeof value.result.listing_id !== "string" ||
     !ID.test(value.result.listing_id) ||
-    !safeInteger(value.result.server_revision, 1) ||
+    !int64(value.result.server_revision, 1n) ||
     typeof value.result.event_id !== "string" ||
     !UUID.test(value.result.event_id)
   ) {
@@ -196,7 +206,7 @@ function hasOnlyKeys(value: object, allowed: readonly string[]): boolean {
   return keys.length <= allowed.length && keys.every((key) => allowed.includes(key));
 }
 
-function validateAdjustRequest(request: InventoryAdjustRequest): JsonObject {
+function validateAdjustRequest(request: InventoryAdjustRequest): LosslessJsonObject {
   if (
     !hasOnlyKeys(request, [
       "schema_version",
@@ -214,11 +224,11 @@ function validateAdjustRequest(request: InventoryAdjustRequest): JsonObject {
     !validatePrintable(request.aggregate_id, 256) ||
     !ID.test(request.listing_id) ||
     request.listing_id.length > 128 ||
-    !Number.isSafeInteger(request.expected_revision) ||
-    request.expected_revision < 1 ||
-    !Number.isSafeInteger(request.delta) ||
-    request.delta === 0 ||
-    Math.abs(request.delta) > 1_000_000 ||
+    !int64(request.expected_revision as LosslessJsonValue, 1n) ||
+    !int64(request.delta as LosslessJsonValue) ||
+    request.delta === 0n ||
+    request.delta < -1_000_000n ||
+    request.delta > 1_000_000n ||
     !UUID.test(request.idempotency_key)
   ) {
     throw new PubkyShopError("validation_failed");
@@ -247,7 +257,7 @@ function validateAdjustRequest(request: InventoryAdjustRequest): JsonObject {
   ) {
     throw new PubkyShopError("validation_failed");
   }
-  return request as unknown as JsonObject;
+  return request as unknown as LosslessJsonObject;
 }
 
 async function readBoundedBody(response: Response, maximum: number): Promise<Uint8Array> {
@@ -295,7 +305,7 @@ async function readBoundedBody(response: Response, maximum: number): Promise<Uin
   return body;
 }
 
-function decodeKnownServiceCode(value: JsonValue): KnownServiceErrorCode | undefined {
+function decodeKnownServiceCode(value: LosslessJsonValue): KnownServiceErrorCode | undefined {
   if (!object(value) || !object(value.error) || typeof value.error.code !== "string") {
     return undefined;
   }
@@ -345,7 +355,7 @@ export class PubkyShopClient {
   ): Promise<SdkResult<InventoryAdjustmentEnvelope>> {
     let body: string;
     try {
-      body = canonicalJson(validateAdjustRequest(request));
+      body = canonicalJsonLossless(validateAdjustRequest(request));
     } catch {
       return err(new PubkyShopError("validation_failed"));
     }
@@ -356,7 +366,7 @@ export class PubkyShopClient {
     path: string,
     method: "GET" | "POST",
     body: string | undefined,
-    decode: (value: JsonValue) => T,
+    decode: (value: LosslessJsonValue) => T,
   ): Promise<SdkResult<T>> {
     const target = new URL(path, this.#origin);
     if (target.origin !== this.#origin) {
@@ -391,9 +401,9 @@ export class PubkyShopClient {
         error instanceof PubkyShopError ? error : new PubkyShopError("response_limit_exceeded"),
       );
     }
-    let value: JsonValue;
+    let value: LosslessJsonValue;
     try {
-      value = parseBoundedJson(bytes, {
+      value = parseBoundedJsonLossless(bytes, {
         maxBytes: this.#maxResponseBytes,
         maxDepth: 32,
         maxNodes: 100_000,

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { PubkyShopError } from "./errors.js";
 import {
   type JsonLimits,
@@ -72,10 +74,13 @@ const LISTING_COLUMNS = [
 ] as const satisfies readonly CanonicalCsvColumn[];
 
 export interface CsvLimits {
+  /** Complete-source cap used only by bounded byte-array convenience APIs and export. */
   readonly maxBytes: number;
+  /** Complete-row-count cap used only by bounded materializing convenience APIs and export. */
   readonly maxRows: number;
   readonly maxColumns: number;
   readonly maxCellBytes: number;
+  readonly maxRowBytes: number;
   readonly maxNestingDepth: number;
   readonly maxWorkingSetBytes: number;
 }
@@ -85,9 +90,46 @@ export const DEFAULT_CSV_LIMITS: CsvLimits = Object.freeze({
   maxRows: 100_000,
   maxColumns: 128,
   maxCellBytes: 1024 * 1024,
+  maxRowBytes: 8 * 1024 * 1024,
   maxNestingDepth: 32,
-  maxWorkingSetBytes: 96 * 1024 * 1024,
+  maxWorkingSetBytes: 64 * 1024 * 1024,
 });
+
+/**
+ * Streaming input limits never cap total source bytes or total row count.
+ * `maxWorkingSetBytes` covers parser-owned decoded cells and one emitted row;
+ * upstream stream queues remain the host's responsibility.
+ */
+export type CsvStreamLimits = Omit<CsvLimits, "maxBytes" | "maxRows">;
+
+export const DEFAULT_CSV_STREAM_LIMITS: CsvStreamLimits = Object.freeze({
+  maxColumns: DEFAULT_CSV_LIMITS.maxColumns,
+  maxCellBytes: DEFAULT_CSV_LIMITS.maxCellBytes,
+  maxRowBytes: DEFAULT_CSV_LIMITS.maxRowBytes,
+  maxNestingDepth: DEFAULT_CSV_LIMITS.maxNestingDepth,
+  maxWorkingSetBytes: DEFAULT_CSV_LIMITS.maxWorkingSetBytes,
+});
+
+export type CsvByteSource =
+  | AsyncIterable<Uint8Array>
+  | ReadableStream<Uint8Array>
+  | Iterable<Uint8Array>;
+
+export interface CsvStreamResourceUsage {
+  readonly sourceBytes: bigint;
+  readonly rowCount: number;
+  readonly peakParserBufferedBytes: number;
+  readonly maxParserBufferedBytes: number;
+}
+
+export interface ParsedCanonicalCsvStream {
+  readonly headers: readonly string[];
+  readonly sourceSha256: string;
+  readonly hadBom: boolean;
+  readonly resourceUsage: CsvStreamResourceUsage;
+}
+
+export type CanonicalCsvRowSink = (row: CanonicalCsvRow) => void | Promise<void>;
 
 export interface CanonicalCsvRow {
   readonly recordUri: string;
@@ -134,16 +176,26 @@ export interface CsvExportOptions {
 interface RawRow {
   readonly cells: readonly string[];
   readonly sourceRow: number;
+  readonly byteLength: number;
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const dangerousFormulaPrefix = /^[=+\-@]/;
 const pubkyId = /^[A-Za-z0-9_.-]{1,128}$/;
 const currencyCode = /^[A-Z]{3}$/;
 
 function limitsFrom(overrides: Partial<CsvLimits> | undefined): CsvLimits {
   const limits = { ...DEFAULT_CSV_LIMITS, ...overrides };
+  for (const [field, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new PubkyShopError("invalid_configuration", { field });
+    }
+  }
+  return limits;
+}
+
+function streamLimitsFrom(overrides: Partial<CsvStreamLimits> | undefined): CsvStreamLimits {
+  const limits = { ...DEFAULT_CSV_STREAM_LIMITS, ...overrides };
   for (const [field, value] of Object.entries(limits)) {
     if (!Number.isSafeInteger(value) || value < 1) {
       throw new PubkyShopError("invalid_configuration", { field });
@@ -186,119 +238,260 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+const UTF8_BOM = new Uint8Array([0xef, 0xbb, 0xbf]);
+const PARSER_QUANTUM_BYTES = 64 * 1024;
+
+class IncrementalRawCsvParser {
+  readonly #limits: CsvStreamLimits;
+  readonly #decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  #preamble: number[] = [];
+  #preambleResolved = false;
+  #hadBom = false;
+  #cells: string[] = [];
+  #cellParts: string[] = [];
+  #cellSegment = "";
+  #cellBytes = 0;
+  #cellUnits = 0;
+  #completedCellUnits = 0;
+  #rowBytes = 0;
+  #line = 1;
+  #rowStart = 1;
+  #quoted = false;
+  #quotePending = false;
+  #afterQuote = false;
+  #pendingCr = false;
+  #rowActive = false;
+  #sawText = false;
+  #peakBufferedBytes = 0;
+
+  constructor(limits: CsvStreamLimits) {
+    this.#limits = limits;
+  }
+
+  get hadBom(): boolean {
+    return this.#hadBom;
+  }
+
+  get peakBufferedBytes(): number {
+    return this.#peakBufferedBytes;
+  }
+
+  write(bytes: Uint8Array): RawRow[] {
+    const rows: RawRow[] = [];
+    let offset = 0;
+    if (!this.#preambleResolved) {
+      while (offset < bytes.byteLength && this.#preamble.length < UTF8_BOM.byteLength) {
+        this.#preamble.push(bytes[offset] ?? 0);
+        offset += 1;
+        const index = this.#preamble.length - 1;
+        if (this.#preamble[index] !== UTF8_BOM[index]) {
+          this.#preambleResolved = true;
+          this.#decode(new Uint8Array(this.#preamble), rows, true);
+          this.#preamble = [];
+          break;
+        }
+      }
+      if (!this.#preambleResolved && this.#preamble.length === UTF8_BOM.byteLength) {
+        this.#preambleResolved = true;
+        this.#hadBom = true;
+        this.#preamble = [];
+      }
+    }
+    if (offset < bytes.byteLength) {
+      this.#decode(bytes.subarray(offset), rows, true);
+    }
+    return rows;
+  }
+
+  finish(): RawRow[] {
+    const rows: RawRow[] = [];
+    if (!this.#preambleResolved) {
+      this.#preambleResolved = true;
+      if (this.#preamble.length > 0) {
+        this.#decode(new Uint8Array(this.#preamble), rows, true);
+      }
+      this.#preamble = [];
+    }
+    this.#decode(new Uint8Array(), rows, false);
+    if (this.#quotePending) {
+      this.#quotePending = false;
+      this.#quoted = false;
+      this.#afterQuote = true;
+    }
+    if (this.#pendingCr || this.#quoted) {
+      throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+    }
+    if (this.#cellBytes > 0 || this.#cells.length > 0 || this.#afterQuote || this.#rowActive) {
+      rows.push(this.#finishRow());
+    }
+    if (!this.#sawText && rows.length === 0) {
+      throw new PubkyShopError("invalid_csv_header");
+    }
+    return rows;
+  }
+
+  #decode(bytes: Uint8Array, rows: RawRow[], stream: boolean): void {
+    let text: string;
+    try {
+      text = this.#decoder.decode(bytes, { stream });
+    } catch {
+      throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+    }
+    if (text.length > 0) {
+      this.#sawText = true;
+    }
+    for (const character of text) {
+      this.#character(character, rows);
+    }
+  }
+
+  #character(character: string, rows: RawRow[]): void {
+    if (this.#pendingCr) {
+      if (character !== "\n") {
+        throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+      }
+      this.#pendingCr = false;
+      this.#line += 1;
+      if (this.#quoted) {
+        this.#append("\r\n");
+      } else {
+        rows.push(this.#finishRow());
+        this.#rowStart = this.#line;
+      }
+      return;
+    }
+    if (this.#quoted) {
+      if (this.#quotePending) {
+        if (character === '"') {
+          this.#quotePending = false;
+          this.#append('"');
+          return;
+        }
+        this.#quotePending = false;
+        this.#quoted = false;
+        this.#afterQuote = true;
+        this.#character(character, rows);
+        return;
+      }
+      if (character === '"') {
+        this.#quotePending = true;
+      } else if (character === "\r") {
+        this.#pendingCr = true;
+      } else if (character === "\n") {
+        throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+      } else {
+        this.#append(character);
+      }
+      return;
+    }
+    if (this.#afterQuote && character !== "," && character !== "\r") {
+      throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+    }
+    if (
+      character === '"' &&
+      this.#cellBytes === 0 &&
+      this.#cellParts.length === 0 &&
+      this.#cellSegment.length === 0
+    ) {
+      this.#quoted = true;
+      this.#rowActive = true;
+    } else if (character === '"') {
+      throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+    } else if (character === ",") {
+      this.#finishCell();
+      this.#rowActive = true;
+    } else if (character === "\r") {
+      this.#pendingCr = true;
+    } else if (character === "\n" || this.#afterQuote) {
+      throw new PubkyShopError("malformed_csv", { sourceRow: this.#rowStart });
+    } else {
+      this.#append(character);
+      this.#rowActive = true;
+    }
+  }
+
+  #append(value: string): void {
+    const bytes = encoder.encode(value).byteLength;
+    this.#cellBytes += bytes;
+    this.#rowBytes += bytes;
+    if (this.#cellBytes > this.#limits.maxCellBytes) {
+      limit("csv_cell_bytes", this.#limits.maxCellBytes, this.#cellBytes, this.#rowStart);
+    }
+    if (this.#rowBytes > this.#limits.maxRowBytes) {
+      limit("csv_row_bytes", this.#limits.maxRowBytes, this.#rowBytes, this.#rowStart);
+    }
+    this.#cellSegment += value;
+    this.#cellUnits += value.length;
+    if (this.#cellSegment.length >= 4096) {
+      this.#cellParts.push(this.#cellSegment);
+      this.#cellSegment = "";
+    }
+    this.#charge();
+  }
+
+  #finishCell(): void {
+    this.#cells.push(`${this.#cellParts.join("")}${this.#cellSegment}`);
+    this.#completedCellUnits += this.#cellUnits;
+    if (this.#cells.length > this.#limits.maxColumns) {
+      limit("csv_columns", this.#limits.maxColumns, this.#cells.length, this.#rowStart);
+    }
+    this.#cellParts = [];
+    this.#cellSegment = "";
+    this.#cellBytes = 0;
+    this.#cellUnits = 0;
+    this.#afterQuote = false;
+    this.#charge();
+  }
+
+  #finishRow(): RawRow {
+    this.#finishCell();
+    const row = {
+      cells: this.#cells,
+      sourceRow: this.#rowStart,
+      byteLength: this.#rowBytes,
+    };
+    this.#cells = [];
+    this.#rowBytes = 0;
+    this.#completedCellUnits = 0;
+    this.#rowActive = false;
+    this.#afterQuote = false;
+    this.#charge();
+    return row;
+  }
+
+  #charge(): void {
+    const observed =
+      this.#rowBytes +
+      (this.#cellUnits + this.#completedCellUnits) * 2 +
+      this.#cellParts.length * 16 +
+      this.#cells.length * 16;
+    this.#peakBufferedBytes = Math.max(this.#peakBufferedBytes, observed);
+    if (observed > this.#limits.maxWorkingSetBytes) {
+      limit("csv_working_set_bytes", this.#limits.maxWorkingSetBytes, observed, this.#rowStart);
+    }
+  }
+}
+
 function parseRawCsv(input: Uint8Array, limits: CsvLimits): { rows: RawRow[]; hadBom: boolean } {
   if (input.byteLength > limits.maxBytes) {
     limit("csv_bytes", limits.maxBytes, input.byteLength);
   }
-  if (input.byteLength > limits.maxWorkingSetBytes) {
-    limit("csv_working_set_bytes", limits.maxWorkingSetBytes, input.byteLength);
-  }
-  let text: string;
-  try {
-    text = decoder.decode(input);
-  } catch {
-    throw new PubkyShopError("malformed_csv");
-  }
-  const estimatedWorkingSet = input.byteLength + text.length * 6;
-  if (estimatedWorkingSet > limits.maxWorkingSetBytes) {
-    limit("csv_working_set_bytes", limits.maxWorkingSetBytes, estimatedWorkingSet);
-  }
-  const hadBom = text.charCodeAt(0) === 0xfeff;
-  if (hadBom) {
-    text = text.slice(1);
-  }
-  if (text.length === 0) {
-    throw new PubkyShopError("invalid_csv_header");
-  }
-
+  const parser = new IncrementalRawCsvParser(limits);
   const rows: RawRow[] = [];
-  let cells: string[] = [];
-  let cell = "";
-  let quoted = false;
-  let afterQuote = false;
-  let line = 1;
-  let rowStart = 1;
-
-  const pushCell = (): void => {
-    const size = encoder.encode(cell).byteLength;
-    if (size > limits.maxCellBytes) {
-      limit("csv_cell_bytes", limits.maxCellBytes, size, rowStart);
-    }
-    cells.push(cell);
-    if (cells.length > limits.maxColumns) {
-      limit("csv_columns", limits.maxColumns, cells.length, rowStart);
-    }
-    cell = "";
-    afterQuote = false;
-  };
-
-  const pushRow = (): void => {
-    pushCell();
-    rows.push({ cells, sourceRow: rowStart });
+  for (let offset = 0; offset < input.byteLength; offset += PARSER_QUANTUM_BYTES) {
+    rows.push(...parser.write(input.subarray(offset, offset + PARSER_QUANTUM_BYTES)));
     if (rows.length - 1 > limits.maxRows) {
-      limit("csv_rows", limits.maxRows, rows.length - 1, rowStart);
-    }
-    cells = [];
-  };
-
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (quoted) {
-      if (character === '"') {
-        if (text[index + 1] === '"') {
-          cell += '"';
-          index += 1;
-        } else {
-          quoted = false;
-          afterQuote = true;
-        }
-      } else if (character === "\r") {
-        if (text[index + 1] !== "\n") {
-          throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-        }
-        cell += "\r\n";
-        index += 1;
-        line += 1;
-      } else if (character === "\n") {
-        throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-      } else {
-        cell += character;
-      }
-      continue;
-    }
-    if (afterQuote && character !== "," && character !== "\r") {
-      throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-    }
-    if (character === '"' && cell.length === 0 && !afterQuote) {
-      quoted = true;
-    } else if (character === '"') {
-      throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-    } else if (character === ",") {
-      pushCell();
-    } else if (character === "\r") {
-      if (text[index + 1] !== "\n") {
-        throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-      }
-      pushRow();
-      index += 1;
-      line += 1;
-      rowStart = line;
-    } else if (character === "\n" || afterQuote) {
-      throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-    } else {
-      cell += character;
+      limit("csv_rows", limits.maxRows, rows.length - 1);
     }
   }
-  if (quoted) {
-    throw new PubkyShopError("malformed_csv", { sourceRow: rowStart });
-  }
-  if (cell.length > 0 || cells.length > 0 || afterQuote) {
-    pushRow();
+  rows.push(...parser.finish());
+  if (rows.length - 1 > limits.maxRows) {
+    limit("csv_rows", limits.maxRows, rows.length - 1);
   }
   if (rows.length === 0) {
     throw new PubkyShopError("invalid_csv_header");
   }
-  return { rows, hadBom };
+  return { rows, hadBom: parser.hadBom };
 }
 
 function exactInteger(
@@ -337,7 +530,12 @@ function boolean(value: string, sourceRow: number): boolean {
   });
 }
 
-function nested(value: string, field: string, sourceRow: number, limits: CsvLimits): JsonValue {
+function nested(
+  value: string,
+  field: string,
+  sourceRow: number,
+  limits: CsvStreamLimits,
+): JsonValue {
   if (value === "") {
     throw new PubkyShopError("invalid_mapping", { field, sourceRow });
   }
@@ -434,7 +632,7 @@ function validateIdentity(row: CanonicalCsvRow): void {
 function rawToCanonical(
   raw: RawRow,
   headers: readonly string[],
-  limits: CsvLimits,
+  limits: CsvStreamLimits,
 ): CanonicalCsvRow {
   const values: Record<string, string> = Object.create(null) as Record<string, string>;
   for (let index = 0; index < headers.length; index += 1) {
@@ -528,6 +726,130 @@ function rawToCanonical(
   return row;
 }
 
+function validatedHeaders(header: RawRow): readonly string[] {
+  const headers = header.cells.map((cell) => formulaDecoded(cell, header.sourceRow));
+  if (
+    headers.length === 0 ||
+    headers.some((value) => value === "") ||
+    new Set(headers).size !== headers.length
+  ) {
+    throw new PubkyShopError("invalid_csv_header");
+  }
+  for (const column of CANONICAL_CSV_COLUMNS) {
+    if (!headers.includes(column)) {
+      throw new PubkyShopError("invalid_csv_header", { field: column });
+    }
+  }
+  return Object.freeze(headers);
+}
+
+async function* sourceChunks(source: CsvByteSource): AsyncGenerator<Uint8Array> {
+  if (Symbol.asyncIterator in source) {
+    for await (const chunk of source as AsyncIterable<Uint8Array>) {
+      yield chunk;
+    }
+    return;
+  }
+  if (Symbol.iterator in source) {
+    for (const chunk of source as Iterable<Uint8Array>) {
+      yield chunk;
+    }
+    return;
+  }
+  const reader = (source as ReadableStream<Uint8Array>).getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        return;
+      }
+      yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Incrementally decodes and maps an RFC 4180 byte source without retaining
+ * source bytes or prior rows. Cross-row/group validation belongs to
+ * `planImportStream`, which uses a durable external index before committing a
+ * manifest.
+ */
+export async function parseCanonicalCsvStream(
+  source: CsvByteSource,
+  onRow: CanonicalCsvRowSink,
+  overrides?: Partial<CsvStreamLimits>,
+): Promise<ParsedCanonicalCsvStream> {
+  const limits = streamLimitsFrom(overrides);
+  const parser = new IncrementalRawCsvParser(limits);
+  const hash = createHash("sha256");
+  let headers: readonly string[] | undefined;
+  let sourceBytes = 0n;
+  let rowCount = 0;
+  let peakParserBufferedBytes = 0;
+  let retainedHeaderBytes = 0;
+
+  const consume = async (rawRows: readonly RawRow[]): Promise<void> => {
+    for (const raw of rawRows) {
+      if (headers === undefined) {
+        headers = validatedHeaders(raw);
+        retainedHeaderBytes =
+          raw.byteLength * 3 + headers.reduce((sum, header) => sum + header.length * 2 + 16, 0);
+        continue;
+      }
+      if (raw.cells.length !== headers.length) {
+        throw new PubkyShopError("malformed_csv", { sourceRow: raw.sourceRow });
+      }
+      const row = rawToCanonical(raw, headers, limits);
+      const canonicalBytes = encoder.encode(canonicalJson(row as unknown as JsonValue)).byteLength;
+      const charged =
+        retainedHeaderBytes + raw.byteLength * 3 + canonicalBytes * 3 + PARSER_QUANTUM_BYTES * 2;
+      peakParserBufferedBytes = Math.max(
+        peakParserBufferedBytes,
+        parser.peakBufferedBytes,
+        charged,
+      );
+      if (peakParserBufferedBytes > limits.maxWorkingSetBytes) {
+        limit(
+          "csv_working_set_bytes",
+          limits.maxWorkingSetBytes,
+          peakParserBufferedBytes,
+          raw.sourceRow,
+        );
+      }
+      await onRow(row);
+      rowCount += 1;
+    }
+  };
+
+  for await (const sourceChunk of sourceChunks(source)) {
+    if (!(sourceChunk instanceof Uint8Array)) {
+      throw new PubkyShopError("malformed_csv");
+    }
+    sourceBytes += BigInt(sourceChunk.byteLength);
+    hash.update(sourceChunk);
+    for (let offset = 0; offset < sourceChunk.byteLength; offset += PARSER_QUANTUM_BYTES) {
+      await consume(parser.write(sourceChunk.subarray(offset, offset + PARSER_QUANTUM_BYTES)));
+    }
+  }
+  await consume(parser.finish());
+  if (headers === undefined) {
+    throw new PubkyShopError("invalid_csv_header");
+  }
+  return Object.freeze({
+    headers,
+    sourceSha256: hash.digest("hex"),
+    hadBom: parser.hadBom,
+    resourceUsage: Object.freeze({
+      sourceBytes,
+      rowCount,
+      peakParserBufferedBytes: Math.max(peakParserBufferedBytes, parser.peakBufferedBytes),
+      maxParserBufferedBytes: limits.maxWorkingSetBytes,
+    }),
+  });
+}
+
 function canonicalCells(row: CanonicalCsvRow): Readonly<Record<CanonicalCsvColumn, string>> {
   return {
     record_uri: row.recordUri,
@@ -556,6 +878,15 @@ function canonicalCells(row: CanonicalCsvRow): Readonly<Record<CanonicalCsvColum
     sale_json: canonicalJson(row.sale),
     external_refs_json: canonicalJson(row.externalRefs),
   };
+}
+
+export function normalizedListingFactsHash(row: CanonicalCsvRow): string {
+  const cells = canonicalCells(row);
+  return sha256Hex(
+    encoder.encode(
+      canonicalJson(Object.fromEntries(LISTING_COLUMNS.map((column) => [column, cells[column]]))),
+    ),
+  );
 }
 
 export function normalizedCsvRowHash(row: CanonicalCsvRow): string {
@@ -603,10 +934,7 @@ function validateRows(rows: readonly CanonicalCsvRow[]): void {
       }
       skus.set(row.sku, variantIdentity);
     }
-    const cells = canonicalCells(row);
-    const facts = canonicalJson(
-      Object.fromEntries(LISTING_COLUMNS.map((column) => [column, cells[column]])),
-    );
+    const facts = normalizedListingFactsHash(row);
     const priorFacts = listingFacts.get(identity);
     if (priorFacts !== undefined && priorFacts !== facts) {
       throw new PubkyShopError("conflicting_listing_fields", {
@@ -627,19 +955,7 @@ export function parseCanonicalCsv(
   if (header === undefined) {
     throw new PubkyShopError("invalid_csv_header");
   }
-  const headers = header.cells.map((cell) => formulaDecoded(cell, header.sourceRow));
-  if (
-    headers.length === 0 ||
-    headers.some((value) => value === "") ||
-    new Set(headers).size !== headers.length
-  ) {
-    throw new PubkyShopError("invalid_csv_header");
-  }
-  for (const column of CANONICAL_CSV_COLUMNS) {
-    if (!headers.includes(column)) {
-      throw new PubkyShopError("invalid_csv_header", { field: column });
-    }
-  }
+  const headers = validatedHeaders(header);
   const rows = rawRows.slice(1).map((raw) => {
     if (raw.cells.length !== headers.length) {
       throw new PubkyShopError("malformed_csv", { sourceRow: raw.sourceRow });

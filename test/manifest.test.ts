@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -13,6 +13,7 @@ import {
   exportCanonicalCsv,
   normalizedCsvRowHash,
   planImport,
+  planImportStream,
   replayImport,
   resumeTasks,
 } from "../src/index.js";
@@ -183,12 +184,225 @@ test("same identity with a different normalized hash is durably quarantined", as
         replay.value.conflicts.map((row) => row.reason),
         ["changed_hash"],
       );
-      assert.equal(replay.value.manifest.rows[0]?.checkpoint, "conflict");
+      assert.equal(replay.value.manifest.rows[0]?.checkpoint, "planned");
+      assert.equal(replay.value.quarantine.quarantineVersion, 1);
     }
     const restarted = await new FileManifestStore(directory).load(planned.value.manifestId);
-    assert.equal(restarted?.rows[0]?.checkpoint, "conflict");
+    assert.equal(restarted?.rows[0]?.checkpoint, "planned");
+    const quarantines = await new FileManifestStore(directory).loadReplayQuarantines(
+      planned.value.manifestId,
+    );
+    assert.equal(quarantines.length, 1);
+    assert.equal(quarantines[0]?.conflicts[0]?.reason, "changed_hash");
+    const persisted = quarantines[0];
+    assert.ok(persisted);
+    const { quarantineVersion: _quarantineVersion, ...staleAppend } = persisted;
+    await assert.rejects(
+      () =>
+        store.compareAndAppendReplayQuarantine(
+          planned.value.manifestId,
+          planned.value.manifestVersion,
+          0,
+          staleAppend,
+        ),
+      (error: unknown) => error instanceof PubkyShopError && error.code === "manifest_conflict",
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("changed replay never rewrites complete, conflict, or failed checkpoint history", async () => {
+  for (const terminal of ["complete", "conflict", "failed"] as const) {
+    const directory = await storeDirectory();
+    try {
+      const store = new FileManifestStore(directory);
+      const planned = await planImport(exportCanonicalCsv([sampleRow()]), {
+        store,
+        manifestId: `terminal-${terminal}`,
+      });
+      assert.equal(planned.ok, true);
+      if (!planned.ok) {
+        continue;
+      }
+      const rowIdentity = planned.value.rows[0]?.rowIdentity;
+      assert.ok(rowIdentity);
+      let current = planned.value;
+      const transitions =
+        terminal === "complete"
+          ? (["publishing", "published_unsynced", "complete"] as const)
+          : ([terminal] as const);
+      for (const checkpoint of transitions) {
+        const transitioned = await checkpointImportRow(
+          store,
+          current.manifestId,
+          current.manifestVersion,
+          rowIdentity,
+          checkpoint,
+          checkpoint === "failed" ? "transport_error" : undefined,
+        );
+        assert.equal(transitioned.ok, true);
+        if (!transitioned.ok) {
+          break;
+        }
+        current = transitioned.value;
+      }
+      assert.equal(current.rows[0]?.checkpoint, terminal);
+
+      const replayed = await replayImport(
+        store,
+        current.manifestId,
+        exportCanonicalCsv([sampleRow({ amountMinor: 13_501 })]),
+      );
+      assert.equal(replayed.ok, true);
+      if (replayed.ok) {
+        assert.equal(replayed.value.kind, "quarantined");
+        assert.equal(replayed.value.manifest.rows[0]?.checkpoint, terminal);
+      }
+
+      const restarted = new FileManifestStore(directory);
+      const loaded = await restarted.load(current.manifestId);
+      assert.equal(loaded?.rows[0]?.checkpoint, terminal);
+      const quarantine = await restarted.loadReplayQuarantines(current.manifestId);
+      assert.equal(quarantine.length, 1);
+      assert.equal(quarantine[0]?.manifestVersion, current.manifestVersion);
+      assert.equal(quarantine[0]?.conflicts[0]?.reason, "changed_hash");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("late malformed stream leaves no committed manifest or planning spool", async () => {
+  const directory = await storeDirectory();
+  try {
+    const valid = exportCanonicalCsv([sampleRow()]);
+    async function* lateMalformed(): AsyncGenerator<Uint8Array> {
+      yield valid;
+      yield new TextEncoder().encode('"unterminated');
+    }
+    const store = new FileManifestStore(directory);
+    const result = await planImportStream(lateMalformed(), {
+      store,
+      manifestId: "late-malformed",
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "malformed_csv");
+    }
+    assert.equal(await store.loadSummary("late-malformed"), null);
+    assert.deepEqual(await readdir(directory), []);
+    assert.equal("publish" in store, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stream planner accepts a source over 64 MiB with asserted bounded buffers", async (t) => {
+  const directory = await storeDirectory();
+  try {
+    const template = exportCanonicalCsv([
+      sampleRow({
+        recordUri: "",
+        sellerPubky: "",
+        listingId: "",
+        sourceListingKey: "source-template",
+        recordRevision: null,
+        variantId: "variant_template",
+        sku: "SKU_TEMPLATE",
+        title: "large stream row",
+        description: "x".repeat(70 * 1024),
+      }),
+    ]);
+    const rendered = new TextDecoder().decode(template);
+    const boundary = rendered.indexOf("\r\n");
+    assert.ok(boundary > 0);
+    const header = rendered.slice(0, boundary + 2);
+    const templateRow = rendered.slice(boundary + 2);
+    const rowBytes = Buffer.byteLength(templateRow);
+    const count = Math.ceil((65 * 1024 * 1024 - Buffer.byteLength(header)) / rowBytes) + 1;
+    let emittedBytes = 0;
+    async function* largeSource(): AsyncGenerator<Uint8Array> {
+      const encodedHeader = new TextEncoder().encode(header);
+      emittedBytes += encodedHeader.byteLength;
+      yield encodedHeader;
+      for (let index = 0; index < count; index += 1) {
+        const suffix = String(index).padStart(6, "0");
+        const row = templateRow
+          .replace("source-template", `source-${suffix}`)
+          .replace("variant_template", `variant_${suffix}`)
+          .replace("SKU_TEMPLATE", `SKU_${suffix}`);
+        const bytes = new TextEncoder().encode(row);
+        emittedBytes += bytes.byteLength;
+        yield bytes;
+      }
+    }
+    const result = await planImportStream(largeSource(), {
+      store: new FileManifestStore(directory),
+      manifestId: "over-64-mib",
+      now: () => new Date("2026-09-19T10:00:00.000Z"),
+      generateListingId: () => randomUUID(),
+      limits: {
+        maxCellBytes: 128 * 1024,
+        maxRowBytes: 256 * 1024,
+        maxWorkingSetBytes: 4 * 1024 * 1024,
+      },
+    });
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.ok(result.value.resourceUsage.sourceBytes > 64n * 1024n * 1024n);
+      assert.equal(result.value.resourceUsage.sourceBytes, BigInt(emittedBytes));
+      assert.equal(result.value.manifest.rowCount, count);
+      assert.ok(
+        result.value.resourceUsage.peakParserBufferedBytes <=
+          result.value.resourceUsage.maxWorkingSetBytes,
+      );
+      assert.ok(
+        result.value.resourceUsage.peakPlannerBufferedBytes <=
+          result.value.resourceUsage.maxWorkingSetBytes,
+      );
+      t.diagnostic(
+        `sourceBytes=${result.value.resourceUsage.sourceBytes} rows=${result.value.resourceUsage.rowCount} parserPeak=${result.value.resourceUsage.peakParserBufferedBytes} plannerPeak=${result.value.resourceUsage.peakPlannerBufferedBytes} bound=${result.value.resourceUsage.maxWorkingSetBytes}`,
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("stream planning produces byte-identical deterministic manifests", async () => {
+  const left = await storeDirectory();
+  const right = await storeDirectory();
+  try {
+    const bytes = exportCanonicalCsv([
+      sampleRow({
+        recordUri: "",
+        sellerPubky: "",
+        listingId: "",
+        sourceListingKey: "deterministic-source",
+        recordRevision: null,
+      }),
+    ]);
+    const options = {
+      manifestId: "deterministic-manifest",
+      now: () => new Date("2026-09-19T10:00:00.000Z"),
+      generateListingId: () => "deterministic-listing",
+    };
+    const first = await planImportStream([bytes], {
+      store: new FileManifestStore(left),
+      ...options,
+    });
+    const second = await planImportStream([bytes], {
+      store: new FileManifestStore(right),
+      ...options,
+    });
+    assert.equal(first.ok, true);
+    assert.equal(second.ok, true);
+    const filename = "deterministic-manifest.manifest.jsonl";
+    assert.deepEqual(await readFile(join(left, filename)), await readFile(join(right, filename)));
+  } finally {
+    await rm(left, { recursive: true, force: true });
+    await rm(right, { recursive: true, force: true });
   }
 });
 
@@ -321,7 +535,7 @@ test("durable store recovers a dead-process lock without weakening compare-and-s
     });
     assert.equal(planned.ok, true);
     assert.deepEqual((await readdir(directory)).filter((name) => !name.startsWith("._")).sort(), [
-      "manifest-stale-lock.json",
+      "manifest-stale-lock.manifest.jsonl",
     ]);
   } finally {
     await rm(directory, { recursive: true, force: true });

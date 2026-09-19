@@ -101,15 +101,111 @@ test("captured adjustment request and response run through the real client", asy
     serviceUrl: "https://inventory.example",
     fetch,
   });
-  const request = capture.request.body as Parameters<PubkyShopClient["adjustInventory"]>[0];
+  const capturedRequest = capture.request.body as Record<string, unknown>;
+  const request = {
+    ...capturedRequest,
+    expected_revision: BigInt(capturedRequest.expected_revision as number),
+    delta: BigInt(capturedRequest.delta as number),
+  } as Parameters<PubkyShopClient["adjustInventory"]>[0];
   const result = await client.adjustInventory(request);
 
   assert.equal(result.ok, true);
-  assert.deepEqual(posted, request);
+  assert.deepEqual(posted, capturedRequest);
   if (result.ok) {
-    assert.equal(result.value.result.stock.total, 5);
-    assert.equal(result.value.result.server_revision, 2);
+    assert.equal(result.value.result.stock.total, 5n);
+    assert.equal(result.value.result.server_revision, 2n);
   }
+});
+
+test("service int64 boundaries decode losslessly for projections and adjustments", async () => {
+  for (const token of ["9007199254740991", "9007199254740992", "9223372036854775807"]) {
+    const projection = new PubkyShopClient({
+      session: "opaque-host-bearer",
+      serviceUrl: "https://inventory.example/",
+      fetch: async () =>
+        new Response(
+          `{"aggregate_id":"listing:test","future_counter":${token},"kind":"inventory_projection","listing_id":"test","schema_version":1,"seller_pubky":"${SELLER_PUBKY}","server_revision":${token},"stock":{"authority":"listing_total","available":${token},"reserved":0,"sold":0,"total":${token}}}`,
+          { status: 200 },
+        ),
+    });
+    const projected = await projection.getInventoryProjection("listing:test");
+    assert.equal(projected.ok, true);
+    if (projected.ok) {
+      assert.equal(projected.value.server_revision, BigInt(token));
+      assert.equal(projected.value.stock.total, BigInt(token));
+      assert.equal(projected.value.future_counter, BigInt(token));
+    }
+
+    const adjustment = new PubkyShopClient({
+      session: "opaque-host-bearer",
+      serviceUrl: "https://inventory.example/",
+      fetch: async () =>
+        new Response(
+          `{"ok":true,"result":{"aggregate_id":"listing:test","event_id":"00000000-0000-4000-8000-000000000002","listing_id":"test","server_revision":${token},"stock":{"authority":"listing_total","available":${token},"reserved":0,"sold":0,"total":${token}}},"schema_version":1}`,
+          { status: 200 },
+        ),
+    });
+    const adjusted = await adjustment.adjustInventory({
+      schema_version: 1,
+      kind: "inventory.adjust",
+      aggregate_id: "listing:test",
+      listing_id: "test",
+      expected_revision: 1n,
+      delta: 1n,
+      idempotency_key: "00000000-0000-4000-8000-000000000001",
+    });
+    assert.equal(adjusted.ok, true);
+    if (adjusted.ok) {
+      assert.equal(adjusted.value.result.server_revision, BigInt(token));
+      assert.equal(adjusted.value.result.stock.total, BigInt(token));
+    }
+  }
+});
+
+test("service int64 overflow and non-integer tokens fail closed", async () => {
+  for (const token of ["9223372036854775808", "1.5"]) {
+    const client = new PubkyShopClient({
+      session: "opaque-host-bearer",
+      serviceUrl: "https://inventory.example/",
+      fetch: async () =>
+        new Response(
+          `{"aggregate_id":"listing:test","kind":"inventory_projection","listing_id":"test","schema_version":1,"seller_pubky":"${SELLER_PUBKY}","server_revision":${token},"stock":{"authority":"listing_total","available":1,"reserved":0,"sold":0,"total":1}}`,
+          { status: 200 },
+        ),
+    });
+    const result = await client.getInventoryProjection("listing:test");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "invalid_response");
+    }
+  }
+});
+
+test("int64 request fields serialize as exact JSON number tokens", async () => {
+  let posted = "";
+  const client = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async (_input, init) => {
+      posted = String(init?.body);
+      return new Response(
+        '{"ok":true,"result":{"aggregate_id":"listing:test","event_id":"00000000-0000-4000-8000-000000000002","listing_id":"test","server_revision":1,"stock":{"authority":"listing_total","available":1,"reserved":0,"sold":0,"total":1}},"schema_version":1}',
+        { status: 200 },
+      );
+    },
+  });
+  const result = await client.adjustInventory({
+    schema_version: 1,
+    kind: "inventory.adjust",
+    aggregate_id: "listing:test",
+    listing_id: "test",
+    expected_revision: 9_223_372_036_854_775_807n,
+    delta: -1n,
+    idempotency_key: "00000000-0000-4000-8000-000000000001",
+  });
+  assert.equal(result.ok, true);
+  assert.match(posted, /"expected_revision":9223372036854775807/);
+  assert.doesNotMatch(posted, /"expected_revision":"9223372036854775807"/);
 });
 
 test("bearer is origin-confined and redirects are never followed", async () => {
@@ -233,11 +329,11 @@ test("runtime request validation rejects unknown fields before transport", async
     kind: "inventory.adjust",
     aggregate_id: `listing:${SELLER_PUBKY}_boots_01`,
     listing_id: "boots_01",
-    expected_revision: 1,
-    delta: 1,
+    expected_revision: 1n,
+    delta: 1n,
     idempotency_key: "00000000-0000-4000-8000-000000000001",
     attacker_field: "must-not-send",
-  } as Parameters<PubkyShopClient["adjustInventory"]>[0]);
+  } as unknown as Parameters<PubkyShopClient["adjustInventory"]>[0]);
   assert.equal(result.ok, false);
   assert.equal(requests, 0);
 });

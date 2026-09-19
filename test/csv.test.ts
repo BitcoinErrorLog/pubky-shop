@@ -7,6 +7,7 @@ import {
   PubkyShopError,
   exportCanonicalCsv,
   parseCanonicalCsv,
+  parseCanonicalCsvStream,
 } from "../src/index.js";
 import { sampleRow } from "./helpers.js";
 
@@ -58,6 +59,51 @@ test("parser accepts BOM or no BOM and Excel mode emits one explicit BOM", () =>
   assert.deepEqual(
     parseCanonicalCsv(excel).rows.map((row) => row.title),
     parseCanonicalCsv(normal).rows.map((row) => row.title),
+  );
+});
+
+test("stream parser preserves RFC 4180 state across every byte boundary", async () => {
+  const bytes = exportCanonicalCsv(
+    [
+      sampleRow({
+        title: 'Snowman ☃, quote "split"',
+        description: "=literal formula-like description",
+      }),
+    ],
+    { excelBom: true },
+  );
+  async function* oneByteChunks(): AsyncGenerator<Uint8Array> {
+    for (const byte of bytes) {
+      yield new Uint8Array([byte]);
+    }
+  }
+  const rows: ReturnType<typeof sampleRow>[] = [];
+  const parsed = await parseCanonicalCsvStream(oneByteChunks(), (row) => {
+    rows.push(row);
+  });
+  assert.equal(parsed.hadBom, true);
+  assert.equal(parsed.resourceUsage.sourceBytes, BigInt(bytes.byteLength));
+  assert.equal(parsed.resourceUsage.rowCount, 1);
+  assert.ok(
+    parsed.resourceUsage.peakParserBufferedBytes <= parsed.resourceUsage.maxParserBufferedBytes,
+  );
+  assert.equal(rows[0]?.title, 'Snowman ☃, quote "split"');
+  assert.equal(rows[0]?.description, "=literal formula-like description");
+
+  const attacked = encoder.encode(
+    decoder.decode(bytes).replace("'=literal formula-like description", "=SUM(1,1)"),
+  );
+  await assert.rejects(
+    () =>
+      parseCanonicalCsvStream(
+        (async function* () {
+          for (let offset = 0; offset < attacked.byteLength; offset += 3) {
+            yield attacked.subarray(offset, offset + 3);
+          }
+        })(),
+        () => undefined,
+      ),
+    (error: unknown) => code(error, "formula_payload"),
   );
 });
 

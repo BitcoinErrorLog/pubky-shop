@@ -8,6 +8,12 @@ export interface JsonObject {
   [key: string]: JsonValue;
 }
 
+export type LosslessJsonPrimitive = JsonPrimitive | bigint;
+export type LosslessJsonValue = LosslessJsonPrimitive | LosslessJsonValue[] | LosslessJsonObject;
+export interface LosslessJsonObject {
+  [key: string]: LosslessJsonValue;
+}
+
 export interface JsonLimits {
   readonly maxBytes: number;
   readonly maxDepth: number;
@@ -72,6 +78,8 @@ function canonicalize(value: unknown, stack: Set<object>): string {
       }
       return JSON.stringify(value);
     }
+    case "bigint":
+      return value.toString(10);
     case "string":
       assertUnicodeScalarString(value);
       return JSON.stringify(value);
@@ -116,6 +124,11 @@ export function canonicalJson(value: JsonValue): string {
   return canonicalize(value, new Set());
 }
 
+/** Deterministic JSON text that emits bigint values as exact integer tokens. */
+export function canonicalJsonLossless(value: LosslessJsonValue): string {
+  return canonicalize(value, new Set());
+}
+
 /** RFC 8785 UTF-8 bytes with exactly one trailing LF. */
 export function encodeCanonicalJson(value: JsonValue): Uint8Array {
   return encoder.encode(`${canonicalJson(value)}\n`);
@@ -126,13 +139,15 @@ class BoundedJsonParser {
   readonly #limits: JsonLimits;
   #index = 0;
   #nodes = 0;
+  readonly #losslessIntegers: boolean;
 
-  constructor(text: string, limits: JsonLimits) {
+  constructor(text: string, limits: JsonLimits, losslessIntegers = false) {
     this.#text = text;
     this.#limits = limits;
+    this.#losslessIntegers = losslessIntegers;
   }
 
-  parse(): JsonValue {
+  parse(): LosslessJsonValue {
     this.#space();
     const value = this.#value(0);
     this.#space();
@@ -149,7 +164,7 @@ class BoundedJsonParser {
     }
   }
 
-  #value(depth: number): JsonValue {
+  #value(depth: number): LosslessJsonValue {
     if (depth > this.#limits.maxDepth) {
       limit("json_nesting_depth", this.#limits.maxDepth, depth);
     }
@@ -214,24 +229,32 @@ class BoundedJsonParser {
     throw new PubkyShopError("invalid_json");
   }
 
-  #number(): number {
+  #number(): number | bigint {
     jsonNumberToken.lastIndex = this.#index;
     const match = jsonNumberToken.exec(this.#text);
     if (!match) {
       throw new PubkyShopError("invalid_json");
     }
     this.#index = jsonNumberToken.lastIndex;
-    const parsed = Number(match[0]);
+    const token = match[0];
+    if (this.#losslessIntegers && !token.includes(".") && !/[eE]/.test(token)) {
+      try {
+        return BigInt(token);
+      } catch {
+        throw new PubkyShopError("invalid_json");
+      }
+    }
+    const parsed = Number(token);
     if (!Number.isFinite(parsed)) {
       throw new PubkyShopError("invalid_json");
     }
     return parsed;
   }
 
-  #object(depth: number): JsonObject {
+  #object(depth: number): LosslessJsonObject {
     this.#index += 1;
     this.#space();
-    const value: JsonObject = Object.create(null) as JsonObject;
+    const value: LosslessJsonObject = Object.create(null) as LosslessJsonObject;
     const keys = new Set<string>();
     if (this.#text[this.#index] === "}") {
       this.#index += 1;
@@ -267,10 +290,10 @@ class BoundedJsonParser {
     throw new PubkyShopError("invalid_json");
   }
 
-  #array(depth: number): JsonValue[] {
+  #array(depth: number): LosslessJsonValue[] {
     this.#index += 1;
     this.#space();
-    const value: JsonValue[] = [];
+    const value: LosslessJsonValue[] = [];
     if (this.#text[this.#index] === "]") {
       this.#index += 1;
       return value;
@@ -324,7 +347,32 @@ export function parseBoundedJson(
       throw new PubkyShopError("invalid_json");
     }
   }
-  return new BoundedJsonParser(text, limits).parse();
+  return new BoundedJsonParser(text, limits).parse() as JsonValue;
+}
+
+export function parseBoundedJsonLossless(
+  input: Uint8Array | string,
+  overrides?: Partial<JsonLimits>,
+): LosslessJsonValue {
+  const limits = mergeLimits(overrides);
+  let text: string;
+  if (typeof input === "string") {
+    const bytes = encoder.encode(input);
+    if (bytes.byteLength > limits.maxBytes) {
+      limit("json_bytes", limits.maxBytes, bytes.byteLength);
+    }
+    text = input;
+  } else {
+    if (input.byteLength > limits.maxBytes) {
+      limit("json_bytes", limits.maxBytes, input.byteLength);
+    }
+    try {
+      text = utf8Decoder.decode(input);
+    } catch {
+      throw new PubkyShopError("invalid_json");
+    }
+  }
+  return new BoundedJsonParser(text, limits, true).parse();
 }
 
 export interface PubkyShopExportEnvelope extends JsonObject {
