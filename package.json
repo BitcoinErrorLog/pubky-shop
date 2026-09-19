@@ -1,0 +1,45 @@
+{
+  "name": "@bitcoinerrorlog/pubky-shop",
+  "version": "0.1.0",
+  "description": "Typed Pubky Shop inventory SDK and deterministic import/export codecs",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "lint": "biome lint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && node --test .test-dist/test/*.test.js",
+    "consumer:check": "npm run build && node test/consumer.mjs",
+    "pack:dry": "npm pack --dry-run --json",
+    "gate": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run consumer:check && npm run pack:dry"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@types/node": "26.6.2",
+    "typescript": "7.0.2"
+  }
+}
