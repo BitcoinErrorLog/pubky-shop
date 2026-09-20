@@ -3,14 +3,17 @@
   "version": "0.1.0",
   "description": "Typed Pubky Shop inventory SDK and deterministic import/export codecs",
   "license": "MIT",
-  "private": true,
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "publishConfig": {
-    "access": "restricted",
+    "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BitcoinErrorLog/pubky-shop.git"
   },
   "files": [
     "dist",
