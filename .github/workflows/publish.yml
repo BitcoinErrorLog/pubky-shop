@@ -52,8 +52,6 @@ jobs:
           fi
 
       - name: Publish with provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public
 
       - name: Verify published tarball
