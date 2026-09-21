@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
-
 import { PubkyShopError } from "./errors.js";
+import { createSha256 } from "./hash.js";
 import {
   type JsonLimits,
   type JsonValue,
@@ -783,7 +782,7 @@ export async function parseCanonicalCsvStream(
 ): Promise<ParsedCanonicalCsvStream> {
   const limits = streamLimitsFrom(overrides);
   const parser = new IncrementalRawCsvParser(limits);
-  const hash = createHash("sha256");
+  const hash = createSha256();
   let headers: readonly string[] | undefined;
   let sourceBytes = 0n;
   let rowCount = 0;
@@ -839,7 +838,7 @@ export async function parseCanonicalCsvStream(
   }
   return Object.freeze({
     headers,
-    sourceSha256: hash.digest("hex"),
+    sourceSha256: hash.digestHex(),
     hadBom: parser.hadBom,
     resourceUsage: Object.freeze({
       sourceBytes,

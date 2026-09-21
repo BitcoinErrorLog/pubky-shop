@@ -1,4 +1,5 @@
-import { FileManifestStore, PubkyShopError } from "../.test-dist/src/index.js";
+import { PubkyShopError } from "../.test-dist/src/index.js";
+import { FileManifestStore } from "../.test-dist/src/node.js";
 
 const [directory, manifestId] = process.argv.slice(2);
 if (directory === undefined || manifestId === undefined) {

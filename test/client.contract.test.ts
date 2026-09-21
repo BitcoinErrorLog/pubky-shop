@@ -3,7 +3,12 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { PubkyShopClient, PubkyShopError, type ServiceAuthTokenSigner } from "../src/index.js";
+import {
+  PubkyShopClient,
+  PubkyShopError,
+  SYNC_MANY_LIMIT,
+  type ServiceAuthTokenSigner,
+} from "../src/index.js";
 import { SELLER_PUBKY } from "./helpers.js";
 
 const fixtureUrl = new URL("../../test/fixtures/service/inventory.json", import.meta.url);
@@ -389,4 +394,151 @@ test("declared and streamed response byte limits fail with safe observed values"
   if (!streamedResult.ok) {
     assert.equal(streamedResult.error.code, "response_limit_exceeded");
   }
+});
+
+test("Wave 3a listings pages attach bearer and preserve unknown fields", async () => {
+  const observed: { url?: string; authorization?: string | undefined } = {};
+  const client = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async (input, init) => {
+      observed.url = String(input);
+      observed.authorization = new Headers(init?.headers).get("authorization") ?? undefined;
+      return new Response(
+        JSON.stringify({
+          listings: [{ listing_id: "boots_01", future_field: true }],
+          cursor: "next",
+        }),
+        { status: 200 },
+      );
+    },
+  });
+  const result = await client.listings(SELLER_PUBKY, { cursor: "abc", limit: 100 });
+  assert.equal(result.ok, true);
+  assert.equal(
+    observed.url,
+    `https://inventory.example/v1/sellers/${SELLER_PUBKY}/listings?limit=100&cursor=abc`,
+  );
+  assert.equal(observed.authorization, "Bearer opaque-host-bearer");
+  if (result.ok) {
+    assert.equal(result.value.cursor, "next");
+  }
+});
+
+test("syncMany chunks 101 ids into 100+1 MULTI_STATUS envelopes", async () => {
+  const bodies: unknown[] = [];
+  const client = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      const posted = bodies[bodies.length - 1] as { listings: { listing_id: string }[] };
+      return new Response(
+        JSON.stringify({
+          schema_version: 1,
+          kind: "listing.sync_many",
+          results: posted.listings.map((item) => ({
+            listing_id: item.listing_id,
+            status: 200,
+          })),
+        }),
+        { status: 207 },
+      );
+    },
+  });
+  const listings = Array.from({ length: 101 }, (_, index) => ({
+    seller_pubky: SELLER_PUBKY,
+    listing_id: `item_${index + 1}`,
+  }));
+  const result = await client.syncMany(listings);
+  assert.equal(result.ok, true);
+  assert.equal(bodies.length, 2);
+  assert.equal((bodies[0] as { listings: unknown[] }).listings.length, SYNC_MANY_LIMIT);
+  assert.equal((bodies[1] as { listings: unknown[] }).listings.length, 1);
+  if (result.ok) {
+    assert.equal(result.value.results.length, 101);
+    assert.equal(result.value.kind, "listing.sync_many");
+  }
+});
+
+test("inventory 403 capability_required and 409 revision_conflict stay typed service errors", async () => {
+  const forbidden = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async () =>
+      new Response(JSON.stringify({ error: { code: "capability_required" } }), { status: 403 }),
+  });
+  const missing = await forbidden.getInventoryProjection("listing:test");
+  assert.equal(missing.ok, false);
+  if (!missing.ok) {
+    assert.equal(missing.error.code, "service_error");
+    assert.equal(missing.error.details.serviceCode, "capability_required");
+    assert.equal(missing.error.details.status, 403);
+  }
+
+  const conflict = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async () =>
+      new Response(JSON.stringify({ error: { code: "revision_conflict" } }), { status: 409 }),
+  });
+  const stale = await conflict.adjustInventory({
+    schema_version: 1,
+    kind: "inventory.adjust",
+    aggregate_id: "listing:test",
+    listing_id: "test",
+    expected_revision: 1n,
+    delta: 1n,
+    idempotency_key: "00000000-0000-4000-8000-000000000001",
+  });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.error.details.serviceCode, "revision_conflict");
+    assert.equal(stale.error.details.status, 409);
+  }
+});
+
+test("createSession posts octet-stream without the existing bearer", async () => {
+  const observed: { contentType?: string | null; authorization?: string | null } = {};
+  const client = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      observed.contentType = headers.get("content-type");
+      observed.authorization = headers.get("authorization");
+      return new Response(
+        JSON.stringify({
+          token: "a".repeat(43),
+          session_id: "00000000-0000-4000-8000-000000000003",
+          pubky: SELLER_PUBKY,
+          capabilities: "/pub/pubky.app/marketplace-service/v1/:rw",
+          expires_at: "2026-09-21T00:00:00Z",
+        }),
+        { status: 201 },
+      );
+    },
+  });
+  const result = await client.createSession(new Uint8Array([1, 2, 3, 4]));
+  assert.equal(result.ok, true);
+  assert.equal(observed.contentType, "application/octet-stream");
+  assert.equal(observed.authorization, null);
+});
+
+test("events since alias is sent as the service cursor query", async () => {
+  let url = "";
+  const client = new PubkyShopClient({
+    session: "opaque-host-bearer",
+    serviceUrl: "https://inventory.example/",
+    fetch: async (input) => {
+      url = String(input);
+      return new Response(JSON.stringify({ events: [] }), { status: 200 });
+    },
+  });
+  const result = await client.events(SELLER_PUBKY, { since: "c1" });
+  assert.equal(result.ok, true);
+  assert.equal(
+    url,
+    `https://inventory.example/v1/sellers/${SELLER_PUBKY}/events?limit=100&cursor=c1`,
+  );
 });

@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
-
 import { PubkyShopError, type SdkResult, err, ok } from "./errors.js";
+import { sha256Hex } from "./hash.js";
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -462,7 +461,7 @@ export function captureSignedRecord(
   }
   return Object.freeze({
     rawBytes: rawBytes.slice(),
-    sha256: createHash("sha256").update(rawBytes).digest("hex"),
+    sha256: sha256Hex(rawBytes),
     parsed,
   });
 }
@@ -473,7 +472,7 @@ export function emitSignedRecord(
   validator?: SignedRecordValidator,
 ): SdkResult<Uint8Array> {
   if (changedRecord === undefined) {
-    const digest = createHash("sha256").update(capture.rawBytes).digest("hex");
+    const digest = sha256Hex(capture.rawBytes);
     if (digest !== capture.sha256) {
       return err(new PubkyShopError("validation_failed"));
     }
@@ -503,6 +502,4 @@ export function emitSignedRecord(
   }
 }
 
-export function sha256Hex(bytes: Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
+export { sha256Hex, sha256HexSubtle } from "./hash.js";
