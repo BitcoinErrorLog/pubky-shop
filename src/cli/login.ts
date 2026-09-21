@@ -61,7 +61,7 @@ export type PendingLoginDescription = {
   readonly has_cli_token: boolean;
   readonly has_result_seed: boolean;
   readonly has_result_delivery_id: boolean;
-  readonly authorization: AuthorizationUrlDescription;
+  readonly auth_url: AuthorizationUrlDescription;
 };
 
 export function describeAuthorizationUrl(url: string): AuthorizationUrlDescription {
@@ -112,7 +112,7 @@ export function describePendingLogin(pending: PendingLogin): PendingLoginDescrip
     has_cli_token: pending.cli_token.length > 0,
     has_result_seed: pending.result_seed.length > 0,
     has_result_delivery_id: pending.result_delivery_id.length > 0,
-    authorization: describeAuthorizationUrl(pending.authorization_url),
+    auth_url: describeAuthorizationUrl(pending.authorization_url),
   };
 }
 

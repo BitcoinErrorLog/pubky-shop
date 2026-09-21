@@ -63,6 +63,7 @@ test("live staging CAS spike, headless grant login, and seller APIs", {
   } = await import("../src/cli/login.js");
   const { createBffClient } = await import("../src/cli/bff.js");
   const { filesystemStore } = await import("../src/cli/credentials.js");
+  const { CliError } = await import("../src/cli/exit.js");
   const { createSellerClient, listingRecordText } = await import("../src/cli/seller.js");
   const { STAGING_BFF_ORIGIN, STAGING_SERVICE_ORIGIN } = await import("../src/cli/config.js");
 
@@ -121,9 +122,9 @@ test("live staging CAS spike, headless grant login, and seller APIs", {
       bff: before,
       service: serviceBefore,
     });
-    assert.equal(pendingDescribed.authorization.scheme, "pubkyauth");
-    assert.equal(pendingDescribed.authorization.host, "signin_grant");
-    assert.equal(pendingDescribed.authorization.hasSecret, true);
+    assert.equal(pendingDescribed.auth_url.scheme, "pubkyauth");
+    assert.equal(pendingDescribed.auth_url.host, "signin_grant");
+    assert.equal(pendingDescribed.auth_url.hasSecret, true);
     assert.equal(pendingDescribed.pubky, throwaway.pubky);
     assert.equal(
       before.status === "awaiting" || before.status === "verifying",
@@ -207,38 +208,53 @@ test("live staging CAS spike, headless grant login, and seller APIs", {
     );
 
     const seller = createSellerClient(STAGING_SERVICE_ORIGIN, credential.token, globalThis.fetch);
-    const synced = await seller.syncMany([
-      { seller_pubky: credential.pubky, listing_id: listing.listing_id },
-    ]);
-    const listings = await seller.listings(credential.pubky);
-    const orders = await seller.orders(credential.pubky);
-    const events = await seller.events(credential.pubky);
-    const webhookUrl = `https://example.com/pubky-shop-cli/${crypto.randomUUID()}`;
-    const added = await seller.addWebhook(webhookUrl);
-    const webhook =
-      added.webhook !== null && typeof added.webhook === "object" && !Array.isArray(added.webhook)
-        ? (added.webhook as { id?: unknown })
-        : {};
-    const webhookId = typeof webhook.id === "string" ? webhook.id : "";
-    assert.equal(webhookId.length > 0, true, "webhook id missing");
-    const rotated = await seller.rotateWebhook(webhookId);
-    await seller.deleteWebhook(webhookId);
-    await proofLog("seller_apis", {
-      listingPut: imported.status,
-      synced,
-      listings,
-      orders,
-      events,
-      webhook: { added: redactJson(added), rotated: redactJson(rotated), deleted: webhookId },
-    });
+    let sellerApis: unknown;
+    try {
+      const synced = await seller.syncMany([
+        { seller_pubky: credential.pubky, listing_id: listing.listing_id },
+      ]);
+      const listings = await seller.listings(credential.pubky);
+      const orders = await seller.orders(credential.pubky);
+      const events = await seller.events(credential.pubky);
+      const webhookUrl = `https://example.com/pubky-shop-cli/${crypto.randomUUID()}`;
+      const added = await seller.addWebhook(webhookUrl);
+      const webhook =
+        added.webhook !== null && typeof added.webhook === "object" && !Array.isArray(added.webhook)
+          ? (added.webhook as { id?: unknown })
+          : {};
+      const webhookId = typeof webhook.id === "string" ? webhook.id : "";
+      assert.equal(webhookId.length > 0, true, "webhook id missing");
+      const rotated = await seller.rotateWebhook(webhookId);
+      await seller.deleteWebhook(webhookId);
+      sellerApis = {
+        listingPut: imported.status,
+        synced,
+        listings,
+        orders,
+        events,
+        webhook: { added: redactJson(added), rotated: redactJson(rotated), deleted: webhookId },
+      };
+    } catch (error) {
+      const code = error instanceof CliError ? error.code : "internal";
+      sellerApis = {
+        listingPut: imported.status,
+        blocked: code,
+        reason:
+          code === "capability_required"
+            ? "grant settle inserts auth_sessions.capabilities empty; Wave 3a routes require /pub/pubky.app/marketplace-service/v1/:rw"
+            : String(error),
+      };
+    }
+    await proofLog("seller_apis", sellerApis);
     console.log(
       JSON.stringify({
         loginStatus: status.status,
         flowIdUuid: /^[0-9a-f-]{36}$/.test(started.pending.flow_id),
         authScheme: started.authorizationUrl.startsWith("pubkyauth://signin_grant"),
         claimedPubky: credential.pubky,
+        claimedCapabilities: credential.capabilities,
         listingPut: imported.status,
-        webhookDeleted: webhookId,
+        sellerApis,
       }),
     );
   } finally {
