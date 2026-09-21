@@ -231,9 +231,45 @@ Error codes:
 `unsupported_record_version_or_field`, `manifest_conflict`,
 `manifest_store_error`, and `changed_replay_quarantined`.
 
+## Seller CLI
+
+`pubky-shop` is the seller command-line client. Shipped defaults are production
+origins (`https://shop.pubky.app` and
+`https://marketplace-service-production-ce23.up.railway.app`). Override with
+`--bff-url` / `--service-url`, `PUBKY_SHOP_BFF_URL` / `PUBKY_SHOP_SERVICE_URL`,
+or `$XDG_CONFIG_HOME/pubky-shop/config.json` keys `bff_url` and `service_url`
+(flags beat env beat file).
+
+Marketplace login uses Shop BFF CLI grant routes. The CLI generates
+`result_cpk` / `result_delivery_id`, proves an existing homeserver session with
+a homeserver PoP PUT, and never holds Shop cookies or BFF signing keys. After
+Ring approval it tickets and claims the service bearer. Missing a homeserver
+session covering `/pub/pubky.app/marketplace/:rw` is exit 2. The bearer is
+stored on Darwin in keychain service `pubky-shop`, account `{origin}|{pubky}`,
+and otherwise under the config directory. Claim does not return a session id;
+`auth logout` requires `--force-local` unless a UUID session id is present.
+
+```sh
+pubky-shop auth login --json --stop-after-qr --qr-path ./login-qr.png --print-url
+pubky-shop auth login --json --complete
+pubky-shop auth status --json
+pubky-shop listings export --format json --output listings.json
+pubky-shop listings import --input listings.json
+pubky-shop orders export --json
+pubky-shop events tail --json
+pubky-shop webhook add --url https://example.invalid/hook
+pubky-shop webhook rotate --id <webhook-id>
+pubky-shop webhook delete --id <webhook-id>
+pubky-shop auth logout --force-local
+```
+
+`--json` prints `{ok,data,error{code,message}}`. Exit `0` success, `1` usage,
+`2` auth/denied, `3` remote/rate-limit/unavailable.
+
 ## Development gates
 
-Dependencies are only TypeScript, Node type declarations, and Biome.
+Runtime dependencies (`@synonymdev/pubky`, `@noble/curves`, `qrcode`) belong to
+the CLI. The SDK import surface does not take them.
 
 ```sh
 npm run format:check
