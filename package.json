@@ -23,7 +23,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "pubky-shop": "./dist/cli/bin.js"
+    "pubky-shop": "dist/cli/bin.js"
   },
   "exports": {
     ".": {
