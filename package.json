@@ -1,7 +1,7 @@
 {
   "name": "@bitcoinerrorlog/pubky-shop",
   "version": "0.1.0",
-  "description": "Typed Pubky Shop inventory SDK and deterministic import/export codecs",
+  "description": "Typed Pubky Shop inventory SDK, deterministic import/export codecs, and seller CLI",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -22,6 +22,9 @@
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "pubky-shop": "./dist/cli/bin.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -40,9 +43,15 @@
     "pack:dry": "npm pack --dry-run --json",
     "gate": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run consumer:check && npm run pack:dry"
   },
+  "dependencies": {
+    "@noble/curves": "2.3.0",
+    "@synonymdev/pubky": "0.11.0",
+    "qrcode": "1.5.4"
+  },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
     "@types/node": "26.6.2",
+    "@types/qrcode": "1.5.6",
     "typescript": "7.0.2"
   }
 }

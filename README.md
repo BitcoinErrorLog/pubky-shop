@@ -231,9 +231,55 @@ Error codes:
 `unsupported_record_version_or_field`, `manifest_conflict`,
 `manifest_store_error`, and `changed_replay_quarantined`.
 
+## Seller CLI
+
+`pubky-shop` is the seller command-line client. Shipped defaults are production
+origins (`https://shop.pubky.app` and
+`https://marketplace-service-production-ce23.up.railway.app`). Override with
+`--bff-url` / `--service-url`, `PUBKY_SHOP_BFF_URL` / `PUBKY_SHOP_SERVICE_URL`,
+or `$XDG_CONFIG_HOME/pubky-shop/config.json` keys `bff_url` and `service_url`
+(flags beat env beat file).
+
+Marketplace login uses Shop BFF CLI grant routes. The CLI generates
+`result_cpk` / `result_delivery_id`, proves an existing homeserver session with
+a homeserver PoP PUT, and never holds Shop cookies or BFF signing keys. Login
+binds the grant to the homeserver session pubky. Headless proof (CI and live
+tests) mints a staging seat, then calls `@synonymdev/pubky` 0.11
+`Signer.approveAuthRequest` on the `pubkyauth://signin_grant` URL so the SDK
+posts GrantClaims. `@synonymdev/pubky` 0.8 posts an AuthToken onto that inbox
+and the grant worker terminalizes `grant_invalid`. After approval, `auth login
+--complete` tickets and claims the service bearer. `auth login` loads a stored
+homeserver session covering `/pub/pubky.app/marketplace/:rw` from keychain
+service `pubky-shop`, account `{origin}|{pubky}|homeserver-session`, or from a
+mode-0600 file in `PUBKY_SHOP_CREDENTIAL_DIR` / the config credential
+directory. The payload is `{pubky,capabilities,secret}` where `secret` is
+`Session.exportLocalSecret()`. Missing that item is exit 2
+`homeserver_session_missing`. Unreadable or unrestorable material is exit 2
+`homeserver_session_invalid`. The marketplace bearer is a separate item,
+account `{origin}|{pubky}`. Claim does not return a session id; `auth logout`
+requires `--force-local` unless a UUID session id is present.
+
+```sh
+PUBKY_SHOP_LIVE=1 npm test -- test/cli.live.test.ts
+pubky-shop auth login --json --complete
+pubky-shop auth status --json
+pubky-shop listings export --format json --output listings.json
+pubky-shop listings import --input listings.json
+pubky-shop orders export --json
+pubky-shop events tail --json
+pubky-shop webhook add --url https://example.invalid/hook
+pubky-shop webhook rotate --id <webhook-id>
+pubky-shop webhook delete --id <webhook-id>
+pubky-shop auth logout --force-local
+```
+
+`--json` prints `{ok,data,error{code,message}}`. Exit `0` success, `1` usage,
+`2` auth/denied, `3` remote/rate-limit/unavailable.
+
 ## Development gates
 
-Dependencies are only TypeScript, Node type declarations, and Biome.
+Runtime dependencies (`@synonymdev/pubky`, `@noble/curves`, `qrcode`) belong to
+the CLI. The SDK import surface does not take them.
 
 ```sh
 npm run format:check
