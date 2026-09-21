@@ -25,7 +25,7 @@ function hexFromBytes(bytes: Uint8Array): string {
 }
 
 /**
- * Incremental SHA-256 that never imports `node:crypto`. Digest bytes match
+ * Incremental SHA-256 with no Node builtin crypto import. Digest bytes match
  * `crypto.subtle.digest("SHA-256", …)` so codecs stay sync while the browser
  * smoke can pin the same function against Web Crypto.
  */
