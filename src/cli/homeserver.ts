@@ -1,4 +1,4 @@
-import { Keypair, PublicKey, Pubky, type Session } from "@synonymdev/pubky";
+import { Keypair, PublicKey, Pubky, resolvePubky, type Session } from "@synonymdev/pubky";
 
 import { STAGING_HOMESERVER_Z32 } from "./config.js";
 import { authError, remoteError } from "./exit.js";
@@ -39,7 +39,8 @@ export async function createThrowawayStagingSignup(signupToken: string): Promise
     async signerApprove(authorizationUrl) {
       await signer.approveAuthRequest(authorizationUrl);
     },
-    clientFetch: (url, init) => pubky.client.fetch(url, init ?? null),
+    clientFetch: (url, init) =>
+      pubky.client.fetch(url.startsWith("pubky://") ? resolvePubky(url) : url, init ?? null),
     async stats(path) {
       const stats = await session.storage.stats(path);
       if (!stats || stats.etag === undefined) {
@@ -61,13 +62,13 @@ export async function putListingRecord(
   body: string,
   etag: string | undefined,
 ): Promise<Response> {
-  const url = `pubky://${throwaway.pubky}${listingPath(listingId)}`;
+  const url = resolvePubky(`pubky://${throwaway.pubky}${listingPath(listingId)}`);
   return await throwaway.clientFetch(url, {
     method: "PUT",
-    headers: {
+    headers: new Headers({
       "content-type": "application/json",
-      ...(etag === undefined ? {} : { "if-match": etag }),
-    },
+      ...(etag === undefined ? {} : { "If-Match": etag }),
+    }),
     body,
     credentials: "include",
   });

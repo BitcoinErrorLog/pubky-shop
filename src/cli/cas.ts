@@ -30,7 +30,7 @@ export async function runCasSpike(
   });
   const created = await putListingRecord(throwaway, listingId, body, undefined);
   const stats = await throwaway.stats(listingPath(listingId));
-  const mismatched = await putListingRecord(throwaway, listingId, body, "deadbeef");
+  const mismatched = await putListingRecord(throwaway, listingId, body, '"deadbeef"');
   const matched = await putListingRecord(throwaway, listingId, body, stats?.etag);
   return {
     created: created.status,
