@@ -7,6 +7,7 @@ import test from "node:test";
 import { filesystemStore } from "../src/cli/credentials.js";
 import { decodeBase64Url32, encodeBase64Url, sha256Bytes } from "../src/cli/encoding.js";
 import { HOMESERVER_CAPABILITY } from "../src/cli/config.js";
+import { describeAuthorizationUrl } from "../src/cli/login.js";
 import { runCli } from "../src/cli/main.js";
 import { proofDocumentText } from "../src/cli/proof.js";
 import type { HomeserverSession } from "../src/cli/proof.js";
@@ -65,6 +66,90 @@ test("proof document is JCS with hashed nonce", () => {
     text.includes(encodeBase64Url(nonce)) === false || text.includes("nonce_hash"),
     true,
   );
+});
+
+test("describeAuthorizationUrl redacts the PoP secret", () => {
+  const described = describeAuthorizationUrl(
+    "pubkyauth://signin_grant?caps=&relay=https%3A%2F%2Fhttprelay.pubky.app%2Finbox&secret=not-a-real-secret&cid=marketplace.staging.shop.pubky.app&cpk=frp1e8hqhe4adpkn3e7un44c8y8xi7op6aqo3quokpa8ipxttw1o",
+  );
+  assert.equal(described.scheme, "pubkyauth");
+  assert.equal(described.host, "signin_grant");
+  assert.equal(described.caps, "");
+  assert.equal(described.relayHost, "httprelay.pubky.app");
+  assert.equal(described.cid, "marketplace.staging.shop.pubky.app");
+  assert.equal(described.cpkLen, 52);
+  assert.equal(described.hasSecret, true);
+  assert.equal(JSON.stringify(described).includes("not-a-real-secret"), false);
+});
+
+test("auth login injects Signer.approveAuthRequest and skips QR emit", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pubky-shop-cli-"));
+  const hs = session();
+  const approved: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api/cli/grant-challenges") && init?.method === "POST") {
+      return jsonResponse(201, {
+        challenge_id: CHALLENGE_ID,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        nonce: encodeBase64Url(Uint8Array.from({ length: 32 }, () => 9)),
+        proof_uri: `pubky://${PUBKY}/pub/pubky.app/marketplace/v1/cli-grant-proofs/${CHALLENGE_ID}`,
+      });
+    }
+    if (url.includes("/verify")) {
+      return jsonResponse(201, {
+        authorization_url: "pubkyauth://signin_grant?x=1&secret=inject-secret",
+        cli_token: `${STATE_ID}.${encodeBase64Url(Uint8Array.from({ length: 32 }, () => 7))}`,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        flow_id: FLOW_ID,
+        state_id: STATE_ID,
+        status: "awaiting",
+      });
+    }
+    return jsonResponse(500, { error: { code: "unexpected" } });
+  };
+  const stdout: string[] = [];
+  const code = await runCli(
+    [
+      "auth",
+      "login",
+      "--json",
+      "--stop-after-qr",
+      "--bff-url",
+      "https://pubky-marketplace-staging.vercel.app",
+      "--service-url",
+      "https://marketplace-service-production.up.railway.app",
+    ],
+    {
+      env: {
+        HOME: root,
+        XDG_CONFIG_HOME: path.join(root, "config"),
+        PUBKY_SHOP_CREDENTIAL_DIR: path.join(root, "creds"),
+      },
+      cwd: root,
+      stdout: {
+        write(chunk) {
+          stdout.push(String(chunk));
+          return true;
+        },
+      },
+      stderr: {
+        write() {
+          return true;
+        },
+      },
+      fetch: fetchImpl,
+      platform: "linux",
+      homeserverSession: hs,
+      signerApprove: async (url) => {
+        approved.push(url);
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.deepEqual(approved, ["pubkyauth://signin_grant?x=1&secret=inject-secret"]);
+  const payload = JSON.parse(stdout.join("")) as { data: { status: string } };
+  assert.equal(payload.data.status, "awaiting_scan");
 });
 
 test("auth login --stop-after-qr writes pending login and does not claim", async () => {

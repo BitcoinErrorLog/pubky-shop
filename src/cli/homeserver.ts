@@ -31,7 +31,7 @@ export async function createThrowawayStagingSignup(signupToken: string): Promise
   const keypair = Keypair.random();
   const signer = pubky.signer(keypair);
   const homeserver = PublicKey.from(STAGING_HOMESERVER_Z32);
-  const session = await signer.signup(homeserver, signupToken);
+  const session = await signer.signupCookie(homeserver, signupToken);
   const wrapped = wrapSession(session);
   return {
     session: wrapped,

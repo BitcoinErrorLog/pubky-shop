@@ -39,6 +39,83 @@ export type LoginStartResult = {
   readonly pubky: string;
 };
 
+export type AuthorizationUrlDescription = {
+  readonly scheme: string;
+  readonly host: string;
+  readonly caps: string | null;
+  readonly relayHost: string | null;
+  readonly cid: string | null;
+  readonly cpkLen: number | null;
+  readonly hasSecret: boolean;
+};
+
+export type PendingLoginDescription = {
+  readonly version: 1;
+  readonly bff_url: string;
+  readonly service_url: string;
+  readonly pubky: string;
+  readonly state_id: string;
+  readonly flow_id: string;
+  readonly expires_at: string;
+  readonly proof_path: string;
+  readonly has_cli_token: boolean;
+  readonly has_result_seed: boolean;
+  readonly has_result_delivery_id: boolean;
+  readonly authorization: AuthorizationUrlDescription;
+};
+
+export function describeAuthorizationUrl(url: string): AuthorizationUrlDescription {
+  try {
+    const parsed = new URL(url);
+    const relay = parsed.searchParams.get("relay");
+    let relayHost: string | null = null;
+    if (relay !== null) {
+      try {
+        relayHost = new URL(relay).host;
+      } catch {
+        relayHost = "invalid";
+      }
+    }
+    const cpk = parsed.searchParams.get("cpk");
+    return {
+      scheme: parsed.protocol.replace(/:$/, ""),
+      host: parsed.hostname,
+      caps: parsed.searchParams.get("caps"),
+      relayHost,
+      cid: parsed.searchParams.get("cid"),
+      cpkLen: cpk === null ? null : cpk.length,
+      hasSecret: parsed.searchParams.has("secret"),
+    };
+  } catch {
+    return {
+      scheme: "invalid",
+      host: "",
+      caps: null,
+      relayHost: null,
+      cid: null,
+      cpkLen: null,
+      hasSecret: false,
+    };
+  }
+}
+
+export function describePendingLogin(pending: PendingLogin): PendingLoginDescription {
+  return {
+    version: pending.version,
+    bff_url: pending.bff_url,
+    service_url: pending.service_url,
+    pubky: pending.pubky,
+    state_id: pending.state_id,
+    flow_id: pending.flow_id,
+    expires_at: pending.expires_at,
+    proof_path: pending.proof_path,
+    has_cli_token: pending.cli_token.length > 0,
+    has_result_seed: pending.result_seed.length > 0,
+    has_result_delivery_id: pending.result_delivery_id.length > 0,
+    authorization: describeAuthorizationUrl(pending.authorization_url),
+  };
+}
+
 function pendingFile(configDir: string): string {
   return path.join(configDir, "pending-login.json");
 }

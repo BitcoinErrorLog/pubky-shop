@@ -242,15 +242,20 @@ or `$XDG_CONFIG_HOME/pubky-shop/config.json` keys `bff_url` and `service_url`
 
 Marketplace login uses Shop BFF CLI grant routes. The CLI generates
 `result_cpk` / `result_delivery_id`, proves an existing homeserver session with
-a homeserver PoP PUT, and never holds Shop cookies or BFF signing keys. After
-Ring approval it tickets and claims the service bearer. Missing a homeserver
-session covering `/pub/pubky.app/marketplace/:rw` is exit 2. The bearer is
-stored on Darwin in keychain service `pubky-shop`, account `{origin}|{pubky}`,
-and otherwise under the config directory. Claim does not return a session id;
+a homeserver PoP PUT, and never holds Shop cookies or BFF signing keys. Login
+binds the grant to the homeserver session pubky. Headless proof (CI and live
+tests) mints a staging seat, then calls `@synonymdev/pubky` 0.11
+`Signer.approveAuthRequest` on the `pubkyauth://signin_grant` URL so the SDK
+posts GrantClaims. `@synonymdev/pubky` 0.8 posts an AuthToken onto that inbox
+and the grant worker terminalizes `grant_invalid`. After approval, `auth login
+--complete` tickets and claims the service bearer. Missing a homeserver session
+covering `/pub/pubky.app/marketplace/:rw` is exit 2. The bearer is stored on
+Darwin in keychain service `pubky-shop`, account `{origin}|{pubky}`, and
+otherwise under the config directory. Claim does not return a session id;
 `auth logout` requires `--force-local` unless a UUID session id is present.
 
 ```sh
-pubky-shop auth login --json --stop-after-qr --qr-path ./login-qr.png --print-url
+PUBKY_SHOP_LIVE=1 npm test -- test/cli.live.test.ts
 pubky-shop auth login --json --complete
 pubky-shop auth status --json
 pubky-shop listings export --format json --output listings.json

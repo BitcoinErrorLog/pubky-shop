@@ -20,6 +20,7 @@ export type CliIo = {
   readonly fetch: typeof fetch;
   readonly platform: string;
   readonly homeserverSession?: HomeserverSession;
+  readonly signerApprove?: (authorizationUrl: string) => Promise<void>;
   readonly now?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly putListing?: (listingId: string, body: string) => Promise<void>;
@@ -39,6 +40,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<ExitCo
       platform: io.platform,
       store: credentialStoreFor(io.env, config.configDir),
       ...(io.homeserverSession === undefined ? {} : { homeserverSession: io.homeserverSession }),
+      ...(io.signerApprove === undefined ? {} : { signerApprove: io.signerApprove }),
       ...(io.now === undefined ? {} : { now: io.now }),
       ...(io.sleep === undefined ? {} : { sleep: io.sleep }),
       ...(io.putListing === undefined ? {} : { putListing: io.putListing }),

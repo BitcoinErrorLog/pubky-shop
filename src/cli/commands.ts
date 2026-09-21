@@ -28,6 +28,7 @@ export type CommandContext = {
   readonly platform: string;
   readonly store: CredentialStore;
   readonly homeserverSession?: HomeserverSession;
+  readonly signerApprove?: (authorizationUrl: string) => Promise<void>;
   readonly now?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly putListing?: (listingId: string, body: string) => Promise<void>;
@@ -187,12 +188,16 @@ async function authLogin(ctx: CommandContext): Promise<JsonResult> {
     ...(ctx.now === undefined ? {} : { now: ctx.now }),
   });
   await writePendingLogin(ctx.config.configDir, started.pending);
-  await emitLoginQr({
-    authorizationUrl: started.authorizationUrl,
-    printUrl: ctx.flags.printUrl,
-    platform: ctx.platform,
-    ...(ctx.flags.qrPath === undefined ? {} : { qrPath: ctx.flags.qrPath }),
-  });
+  if (ctx.signerApprove !== undefined) {
+    await ctx.signerApprove(started.authorizationUrl);
+  } else {
+    await emitLoginQr({
+      authorizationUrl: started.authorizationUrl,
+      printUrl: ctx.flags.printUrl,
+      platform: ctx.platform,
+      ...(ctx.flags.qrPath === undefined ? {} : { qrPath: ctx.flags.qrPath }),
+    });
+  }
   if (ctx.flags.stopAfterQr) {
     return {
       ok: true,
