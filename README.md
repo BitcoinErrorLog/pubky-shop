@@ -4,6 +4,20 @@ Private TypeScript SDK for the Pubky Marketplace inventory HTTP contract,
 deterministic JSON/CSV interchange, and durable import planning. The package is
 ESM-only, requires Node 22 or newer, and is not published by this repository.
 
+## Package exports
+
+- `.` is the browser-safe entry: codecs plus `PubkyShopClient` (Wave 1 inventory
+  and Wave 3a HTTP). It hashes with Web Crypto-compatible SHA-256 and never
+  imports `node:` or `@synonymdev/pubky`.
+- `./node` is the Node planner: `FileManifestStore`, `planImport`,
+  `planImportStream`, `resumeTasks`, and `streamResumeTasks`.
+- `@synonymdev/pubky` is an optional peer used only by the CLI / `./node`.
+
+```ts
+import { PubkyShopClient } from "@bitcoinerrorlog/pubky-shop";
+import { FileManifestStore, planImport } from "@bitcoinerrorlog/pubky-shop/node";
+```
+
 ## Credential ownership
 
 ```ts
@@ -36,7 +50,10 @@ from any homeserver credential.
 
 `getInventoryProjection(aggregateId)` and `adjustInventory(request)` return
 `SdkResult<T>`. They decode the generated Wave 1 contract while preserving
-unknown response fields for forward compatibility. Wave 1 Rust `i64` fields
+unknown response fields for forward compatibility. Wave 3a seller HTTP is on
+the same class: `listings`, `orders`, `events`, `getListing`, `syncMany`
+(chunks of 100), webhooks, and sessions. `createSession` POSTs AuthToken bytes
+as `application/octet-stream` and does not attach an existing bearer. Wave 1 Rust `i64` fields
 (`server_revision` and every stock quantity) are exposed consistently as
 `bigint`, including ordinary small values. Integer JSON tokens are captured
 before JavaScript `Number` conversion, values outside the signed 64-bit range
@@ -278,8 +295,9 @@ pubky-shop auth logout --force-local
 
 ## Development gates
 
-Runtime dependencies (`@synonymdev/pubky`, `@noble/curves`, `qrcode`) belong to
-the CLI. The SDK import surface does not take them.
+Runtime dependencies (`@noble/curves`, `qrcode`) belong to the CLI.
+`@synonymdev/pubky` is an optional peer of `./node` and the CLI. The `.`
+export does not import them.
 
 ```sh
 npm run format:check

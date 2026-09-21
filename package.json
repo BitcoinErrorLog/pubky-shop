@@ -1,9 +1,10 @@
 {
   "name": "@bitcoinerrorlog/pubky-shop",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Typed Pubky Shop inventory SDK, deterministic import/export codecs, and seller CLI",
   "license": "MIT",
   "type": "module",
+  "sideEffects": false,
   "engines": {
     "node": ">=22"
   },
@@ -29,6 +30,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
     }
   },
   "scripts": {
@@ -40,16 +45,25 @@
     "build:test": "tsc -p tsconfig.test.json",
     "test": "npm run build:test && node --test .test-dist/test/*.test.js",
     "consumer:check": "npm run build && node test/consumer.mjs",
+    "browser:check": "npm run build && node test/browser-entry.mjs",
     "pack:dry": "npm pack --dry-run --json",
-    "gate": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run consumer:check && npm run pack:dry"
+    "gate": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run consumer:check && npm run browser:check && npm run pack:dry"
   },
   "dependencies": {
     "@noble/curves": "2.3.0",
-    "@synonymdev/pubky": "0.11.0",
     "qrcode": "1.5.4"
+  },
+  "peerDependencies": {
+    "@synonymdev/pubky": "^0.11.0"
+  },
+  "peerDependenciesMeta": {
+    "@synonymdev/pubky": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
+    "@synonymdev/pubky": "0.11.0",
     "@types/node": "26.6.2",
     "@types/qrcode": "1.5.6",
     "typescript": "7.0.2"

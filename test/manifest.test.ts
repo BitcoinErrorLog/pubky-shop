@@ -20,17 +20,19 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
-  FileManifestStore,
   PubkyShopError,
   canonicalCsvRowIdentity,
-  checkpointImportRow,
   exportCanonicalCsv,
   normalizedCsvRowHash,
+} from "../src/index.js";
+import {
+  FileManifestStore,
+  checkpointImportRow,
   planImport,
   planImportStream,
   replayImport,
   streamResumeTasks,
-} from "../src/index.js";
+} from "../src/node.js";
 import { externalSortLines, minimumExternalSortWorkingSetBytes } from "../src/external-sort.js";
 import { sampleRow } from "./helpers.js";
 

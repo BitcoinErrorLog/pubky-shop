@@ -76,6 +76,39 @@ export interface InventoryAdjustmentEnvelope extends LosslessJsonObject {
   result: InventoryAdjustmentResult;
 }
 
+export const SYNC_MANY_LIMIT = 100;
+
+export interface SellerPageQuery {
+  readonly cursor?: string;
+  readonly limit?: number;
+}
+
+export interface SellerEventsQuery extends SellerPageQuery {
+  /** Alias for `cursor` on `GET /v1/sellers/{pubky}/events`. */
+  readonly since?: string;
+}
+
+export interface SyncManyListing {
+  readonly seller_pubky: string;
+  readonly listing_id: string;
+}
+
+export interface SyncManyEnvelope extends LosslessJsonObject {
+  schema_version: 1n;
+  kind: "listing.sync_many";
+  results: LosslessJsonValue[];
+}
+
+export interface SessionCreated extends LosslessJsonObject {
+  token: string;
+  session_id: string;
+  pubky: string;
+  capabilities: string;
+  expires_at: string;
+}
+
+type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
+
 const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
 const ID = /^[A-Za-z0-9_.-]+$/;
 const CHANNEL = /^[a-z0-9][a-z0-9._-]{0,31}$/;
@@ -188,6 +221,89 @@ export function decodeInventoryAdjustment(value: LosslessJsonValue): InventoryAd
   }
   decodeStock(value.result.stock);
   return value as InventoryAdjustmentEnvelope;
+}
+
+function decodePassthroughObject(value: LosslessJsonValue): LosslessJsonObject {
+  if (!object(value)) {
+    throw new PubkyShopError("invalid_response");
+  }
+  return value;
+}
+
+function decodeSyncMany(value: LosslessJsonValue): SyncManyEnvelope {
+  if (
+    !object(value) ||
+    value.schema_version !== 1n ||
+    value.kind !== "listing.sync_many" ||
+    !Array.isArray(value.results)
+  ) {
+    throw new PubkyShopError("invalid_response");
+  }
+  return value as SyncManyEnvelope;
+}
+
+function decodeSessionCreated(value: LosslessJsonValue): SessionCreated {
+  if (
+    !object(value) ||
+    typeof value.token !== "string" ||
+    typeof value.session_id !== "string" ||
+    !UUID.test(value.session_id) ||
+    typeof value.pubky !== "string" ||
+    value.pubky.length !== 52 ||
+    typeof value.capabilities !== "string" ||
+    typeof value.expires_at !== "string"
+  ) {
+    throw new PubkyShopError("invalid_response");
+  }
+  return value as SessionCreated;
+}
+
+function decodeEmpty(): null {
+  return null;
+}
+
+function validatePubky(pubky: string): boolean {
+  return (
+    pubky.length === 52 &&
+    ![...pubky].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 0x20 || code === 0x7f;
+    })
+  );
+}
+
+function sellerCollectionPath(
+  pubky: string,
+  resource: "listings" | "orders" | "events",
+  query: SellerEventsQuery | SellerPageQuery,
+): string | undefined {
+  if (!validatePubky(pubky)) {
+    return undefined;
+  }
+  const params = new URLSearchParams();
+  const limit = "limit" in query && query.limit !== undefined ? query.limit : 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+    return undefined;
+  }
+  params.set("limit", String(limit));
+  const cursor =
+    "since" in query && query.since !== undefined && query.since.length > 0
+      ? query.since
+      : query.cursor;
+  if (cursor !== undefined) {
+    if (
+      cursor.length < 1 ||
+      cursor.length > 512 ||
+      [...cursor].some((character) => {
+        const code = character.charCodeAt(0);
+        return code <= 0x20 || code === 0x7f;
+      })
+    ) {
+      return undefined;
+    }
+    params.set("cursor", cursor);
+  }
+  return `/v1/sellers/${encodeURIComponent(pubky)}/${resource}?${params.toString()}`;
 }
 
 function validatePrintable(value: string, maximum: number): boolean {
@@ -362,26 +478,188 @@ export class PubkyShopClient {
     return this.#request("/v1/inventory/adjust", "POST", body, decodeInventoryAdjustment);
   }
 
+  async listings(
+    pubky: string,
+    query: SellerPageQuery = {},
+  ): Promise<SdkResult<LosslessJsonObject>> {
+    const path = sellerCollectionPath(pubky, "listings", query);
+    if (path === undefined) {
+      return err(new PubkyShopError("validation_failed", { field: "listings" }));
+    }
+    return this.#request(path, "GET", undefined, decodePassthroughObject);
+  }
+
+  async orders(pubky: string, query: SellerPageQuery = {}): Promise<SdkResult<LosslessJsonObject>> {
+    const path = sellerCollectionPath(pubky, "orders", query);
+    if (path === undefined) {
+      return err(new PubkyShopError("validation_failed", { field: "orders" }));
+    }
+    return this.#request(path, "GET", undefined, decodePassthroughObject);
+  }
+
+  async events(
+    pubky: string,
+    query: SellerEventsQuery = {},
+  ): Promise<SdkResult<LosslessJsonObject>> {
+    const path = sellerCollectionPath(pubky, "events", query);
+    if (path === undefined) {
+      return err(new PubkyShopError("validation_failed", { field: "events" }));
+    }
+    return this.#request(path, "GET", undefined, decodePassthroughObject);
+  }
+
+  async getListing(seller: string, listingId: string): Promise<SdkResult<LosslessJsonObject>> {
+    if (!validatePubky(seller) || !ID.test(listingId) || listingId.length > 128) {
+      return err(new PubkyShopError("validation_failed", { field: "listing" }));
+    }
+    return this.#request(
+      `/v1/listings/${encodeURIComponent(seller)}/${encodeURIComponent(listingId)}`,
+      "GET",
+      undefined,
+      decodePassthroughObject,
+    );
+  }
+
+  async syncMany(listings: readonly SyncManyListing[]): Promise<SdkResult<SyncManyEnvelope>> {
+    if (listings.length < 1) {
+      return err(new PubkyShopError("validation_failed", { field: "listings" }));
+    }
+    const merged: LosslessJsonValue[] = [];
+    for (let offset = 0; offset < listings.length; offset += SYNC_MANY_LIMIT) {
+      const chunk = listings.slice(offset, offset + SYNC_MANY_LIMIT);
+      for (const item of chunk) {
+        if (
+          !validatePubky(item.seller_pubky) ||
+          !ID.test(item.listing_id) ||
+          item.listing_id.length > 128
+        ) {
+          return err(new PubkyShopError("validation_failed", { field: "listings" }));
+        }
+      }
+      const body = canonicalJsonLossless({
+        listings: chunk.map((item) => ({
+          seller_pubky: item.seller_pubky,
+          listing_id: item.listing_id,
+        })),
+      });
+      const result = await this.#request("/v1/listings/sync-many", "POST", body, decodeSyncMany);
+      if (!result.ok) {
+        return result;
+      }
+      merged.push(...result.value.results);
+    }
+    return ok({
+      schema_version: 1n,
+      kind: "listing.sync_many",
+      results: merged,
+    });
+  }
+
+  async addWebhook(url: string): Promise<SdkResult<LosslessJsonObject>> {
+    if (!validatePrintable(url, 2048) || !url.startsWith("https://")) {
+      return err(new PubkyShopError("validation_failed", { field: "url" }));
+    }
+    return this.#request(
+      "/v1/webhooks",
+      "POST",
+      canonicalJsonLossless({ url }),
+      decodePassthroughObject,
+    );
+  }
+
+  async rotateWebhook(id: string): Promise<SdkResult<LosslessJsonObject>> {
+    if (!UUID.test(id)) {
+      return err(new PubkyShopError("validation_failed", { field: "id" }));
+    }
+    return this.#request(
+      `/v1/webhooks/${encodeURIComponent(id)}/rotate`,
+      "POST",
+      canonicalJsonLossless({}),
+      decodePassthroughObject,
+    );
+  }
+
+  async deleteWebhook(id: string): Promise<SdkResult<null>> {
+    if (!UUID.test(id)) {
+      return err(new PubkyShopError("validation_failed", { field: "id" }));
+    }
+    return this.#request(
+      `/v1/webhooks/${encodeURIComponent(id)}`,
+      "DELETE",
+      undefined,
+      decodeEmpty,
+    );
+  }
+
+  async listSessions(): Promise<SdkResult<LosslessJsonObject>> {
+    return this.#request("/v1/auth/sessions", "GET", undefined, decodePassthroughObject);
+  }
+
+  async createSession(authToken: Uint8Array): Promise<SdkResult<SessionCreated>> {
+    if (authToken.byteLength < 1 || authToken.byteLength > 16 * 1024) {
+      return err(new PubkyShopError("validation_failed", { field: "authToken" }));
+    }
+    return this.#request("/v1/auth/sessions", "POST", authToken, decodeSessionCreated, {
+      contentType: "application/octet-stream",
+      authorization: false,
+    });
+  }
+
+  async updateSession(
+    id: string,
+    patch: LosslessJsonObject,
+  ): Promise<SdkResult<LosslessJsonObject>> {
+    if (!UUID.test(id) || !object(patch)) {
+      return err(new PubkyShopError("validation_failed", { field: "session" }));
+    }
+    return this.#request(
+      `/v1/auth/sessions/${encodeURIComponent(id)}`,
+      "PATCH",
+      canonicalJsonLossless(patch),
+      decodePassthroughObject,
+    );
+  }
+
+  async revokeSession(id: string): Promise<SdkResult<null>> {
+    if (!UUID.test(id)) {
+      return err(new PubkyShopError("validation_failed", { field: "id" }));
+    }
+    return this.#request(
+      `/v1/auth/sessions/${encodeURIComponent(id)}`,
+      "DELETE",
+      undefined,
+      decodeEmpty,
+    );
+  }
+
   async #request<T>(
     path: string,
-    method: "GET" | "POST",
-    body: string | undefined,
+    method: HttpMethod,
+    body: string | Uint8Array | undefined,
     decode: (value: LosslessJsonValue) => T,
+    options: { contentType?: string; authorization?: boolean } = {},
   ): Promise<SdkResult<T>> {
     const target = new URL(path, this.#origin);
     if (target.origin !== this.#origin) {
       return err(new PubkyShopError("origin_violation"));
     }
+    const attachAuthorization = options.authorization !== false;
+    const contentType =
+      options.contentType ?? (typeof body === "string" ? "application/json" : undefined);
     let response: Response;
     try {
       response = await this.#fetch(target, {
         method,
         headers: {
           accept: "application/json",
-          authorization: `Bearer ${this.#session}`,
-          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...(attachAuthorization ? { authorization: `Bearer ${this.#session}` } : {}),
+          ...(contentType === undefined ? {} : { "content-type": contentType }),
         },
-        ...(body === undefined ? {} : { body }),
+        ...(body === undefined
+          ? {}
+          : {
+              body: typeof body === "string" ? body : Uint8Array.from(body),
+            }),
         credentials: "omit",
         redirect: "manual",
         referrerPolicy: "no-referrer",
@@ -392,6 +670,14 @@ export class PubkyShopClient {
     if (response.status === 401) {
       await response.body?.cancel().catch(() => undefined);
       return err(new PubkyShopError("session_rejected", { status: 401 }));
+    }
+    if (response.status === 204) {
+      await response.body?.cancel().catch(() => undefined);
+      try {
+        return ok(decode(null));
+      } catch {
+        return err(new PubkyShopError("invalid_response", { status: 204 }));
+      }
     }
     let bytes: Uint8Array;
     try {
