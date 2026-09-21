@@ -64,7 +64,36 @@ jobs:
           npm install -g npm@11.6.2
           npm --version
 
-      - name: Publish with provenance
+      - name: Build package
+        run: npm run build
+
+      - name: Verify packed bin
+        run: |
+          set -euo pipefail
+          bin_path="$(node -p "require('./package.json').bin['pubky-shop']")"
+          if [[ "${bin_path}" != "dist/cli/bin.js" ]]; then
+            echo "::error::package.json bin.pubky-shop must be dist/cli/bin.js (no ./ prefix); got ${bin_path}"
+            exit 1
+          fi
+          if [[ ! -f "${bin_path}" ]]; then
+            echo "::error::bin path ${bin_path} does not exist at pack time"
+            exit 1
+          fi
+          pack_json="$(npm pack --dry-run --json)"
+          printf '%s\n' "${pack_json}" | node --input-type=module -e '
+            const chunks = [];
+            for await (const c of process.stdin) chunks.push(c);
+            const d = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            const entry = Array.isArray(d) ? d[0] : d;
+            const files = (entry.files || []).map((f) => f.path || f);
+            if (!files.includes("dist/cli/bin.js")) {
+              console.error("dist/cli/bin.js missing from npm pack --dry-run");
+              process.exit(1);
+            }
+            console.log("packed dist/cli/bin.js ok; files", files.length);
+          '
+
+      - name: Publish
         run: |
           set -euo pipefail
           unset NODE_AUTH_TOKEN NPM_TOKEN || true
@@ -72,7 +101,8 @@ jobs:
             sed -i '/_authToken/d' "${NPM_CONFIG_USERCONFIG}"
           fi
           npm --version
-          npm publish --provenance --access public
+          # provenance requires a public source repo — re-enable when BitcoinErrorLog/pubky-shop is public
+          npm publish --access public
 
       - name: Verify published tarball
         shell: bash
