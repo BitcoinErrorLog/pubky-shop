@@ -17,6 +17,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
     steps:
@@ -51,8 +54,25 @@ jobs:
             exit 1
           fi
 
+      # Node 22 ships npm 10.x. OIDC trusted publishing needs npm ≥ 11.5.1;
+      # npm 10 signs Sigstore provenance then PUTs unauthenticated → 404 on
+      # scoped packages. setup-node with registry-url also injects
+      # NODE_AUTH_TOKEN (GitHub token), which overrides OIDC even on npm 11.
+      - name: Install npm for OIDC trusted publishing
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.6.2
+          npm --version
+
       - name: Publish with provenance
-        run: npm publish --provenance --access public
+        run: |
+          set -euo pipefail
+          unset NODE_AUTH_TOKEN NPM_TOKEN || true
+          if [[ -n "${NPM_CONFIG_USERCONFIG:-}" && -f "${NPM_CONFIG_USERCONFIG}" ]]; then
+            sed -i '/_authToken/d' "${NPM_CONFIG_USERCONFIG}"
+          fi
+          npm --version
+          npm publish --provenance --access public
 
       - name: Verify published tarball
         shell: bash
