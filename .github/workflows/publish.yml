@@ -108,10 +108,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package_version="$(node -p "require('./package.json').version")"
-          tarball="$(npm view "@bitcoinerrorlog/pubky-shop@${package_version}" dist.tarball)"
-          if [[ -z "${tarball}" ]]; then
-            echo "::error::npm returned no dist.tarball for @bitcoinerrorlog/pubky-shop@${package_version}"
-            exit 1
+          unset NODE_AUTH_TOKEN NPM_TOKEN || true
+          if [[ -n "${NPM_CONFIG_USERCONFIG:-}" && -f "${NPM_CONFIG_USERCONFIG}" ]]; then
+            sed -i '/_authToken/d' "${NPM_CONFIG_USERCONFIG}"
           fi
-          echo "Published tarball: ${tarball}"
+          package_version="$(node -p "require('./package.json').version")"
+          tarball=""
+          for attempt in $(seq 1 10); do
+            if tarball="$(npm view "@bitcoinerrorlog/pubky-shop@${package_version}" dist.tarball 2>/dev/null)" \
+              && [[ -n "${tarball}" ]]; then
+              echo "Published tarball: ${tarball}"
+              exit 0
+            fi
+            echo "npm view missed ${package_version} (attempt ${attempt}/10); waiting 30s for registry processing"
+            if [[ "${attempt}" -lt 10 ]]; then
+              sleep 30
+            fi
+          done
+          echo "::error::npm returned no dist.tarball for @bitcoinerrorlog/pubky-shop@${package_version} after 10 attempts"
+          exit 1
