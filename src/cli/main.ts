@@ -1,4 +1,5 @@
 import { parseArgs, resolveConfig, type FlagMap } from "./config.js";
+import { formatHelp, packageVersion } from "./help.js";
 import {
   credentialStoreFor,
   homeserverSessionStoreFor,
@@ -64,6 +65,14 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<ExitCo
   try {
     const parsed = parseArgs(argv);
     flags = parsed.flags;
+    if (parsed.flags.help) {
+      io.stdout.write(formatHelp(parsed.command));
+      return 0;
+    }
+    if (parsed.flags.version) {
+      io.stdout.write(`${packageVersion()}\n`);
+      return 0;
+    }
     const config = await resolveConfig(parsed.flags, io.env);
     const homeserverSession = await resolveHomeserverSession(
       io,

@@ -35,6 +35,8 @@ test("shipped defaults are production origins", async () => {
       stopAfterQr: false,
       complete: false,
       forceLocal: false,
+      help: false,
+      version: false,
     },
     { HOME: "/tmp/pubky-shop-test-home" },
   );
@@ -50,6 +52,8 @@ test("flags beat env and file", async () => {
       stopAfterQr: false,
       complete: false,
       forceLocal: false,
+      help: false,
+      version: false,
       bffUrl: "https://pubky-marketplace-staging.vercel.app",
       serviceUrl: "https://marketplace-service-production.up.railway.app",
     },

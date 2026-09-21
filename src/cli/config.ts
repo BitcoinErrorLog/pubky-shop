@@ -26,6 +26,8 @@ export type FlagMap = {
   readonly stopAfterQr: boolean;
   readonly complete: boolean;
   readonly forceLocal: boolean;
+  readonly help: boolean;
+  readonly version: boolean;
   readonly bffUrl?: string;
   readonly serviceUrl?: string;
   readonly qrPath?: string;
@@ -132,6 +134,8 @@ export function parseArgs(argv: readonly string[]): {
     stopAfterQr: boolean;
     complete: boolean;
     forceLocal: boolean;
+    help: boolean;
+    version: boolean;
     bffUrl?: string;
     serviceUrl?: string;
     qrPath?: string;
@@ -147,11 +151,17 @@ export function parseArgs(argv: readonly string[]): {
     stopAfterQr: false,
     complete: false,
     forceLocal: false,
+    help: false,
+    version: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === undefined) {
       break;
+    }
+    if (arg === "-h") {
+      flags.help = true;
+      continue;
     }
     if (!arg.startsWith("--")) {
       command.push(arg);
@@ -185,6 +195,12 @@ export function parseArgs(argv: readonly string[]): {
         break;
       case "force-local":
         flags.forceLocal = true;
+        break;
+      case "help":
+        flags.help = true;
+        break;
+      case "version":
+        flags.version = true;
         break;
       case "bff-url":
         flags.bffUrl = next();
