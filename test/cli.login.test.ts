@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { filesystemStore } from "../src/cli/credentials.js";
+import {
+  filesystemHomeserverSessionStore,
+  filesystemStore,
+  homeserverSessionAccount,
+} from "../src/cli/credentials.js";
 import { decodeBase64Url32, encodeBase64Url, sha256Bytes } from "../src/cli/encoding.js";
 import { HOMESERVER_CAPABILITY } from "../src/cli/config.js";
 import { describeAuthorizationUrl } from "../src/cli/login.js";
@@ -332,6 +336,148 @@ test("auth login --complete tickets and claims after status complete", async () 
   assert.equal(stored?.token, "bearer-token");
   const payload = JSON.parse(stdout.join("")) as { data: { pubky: string } };
   assert.equal(payload.data.pubky, PUBKY);
+});
+
+test("auth login loads the homeserver-session file without an injected session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pubky-shop-cli-"));
+  const creds = path.join(root, "creds");
+  const origin = "https://marketplace-service-production.up.railway.app";
+  const store = filesystemHomeserverSessionStore(creds);
+  const secret = "file-store-secret";
+  await store.put(origin, {
+    capabilities: [HOMESERVER_CAPABILITY],
+    pubky: PUBKY,
+    secret,
+  });
+  const storedFile = path.join(
+    creds,
+    `${Buffer.from(homeserverSessionAccount(origin, PUBKY)).toString("hex")}.json`,
+  );
+  const onDisk = JSON.parse(await readFile(storedFile, "utf8")) as {
+    pubky: string;
+    secret: string;
+  };
+  assert.equal(onDisk.pubky, PUBKY);
+  assert.equal(onDisk.secret, secret);
+  const hs = session();
+  const bound: string[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/api/cli/grant-challenges") && init?.method === "POST") {
+      return jsonResponse(201, {
+        challenge_id: CHALLENGE_ID,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        nonce: encodeBase64Url(Uint8Array.from({ length: 32 }, () => 9)),
+        proof_uri: `pubky://${PUBKY}/pub/pubky.app/marketplace/v1/cli-grant-proofs/${CHALLENGE_ID}`,
+      });
+    }
+    if (url.includes("/verify")) {
+      return jsonResponse(201, {
+        authorization_url: "pubkyauth://signin_grant?x=1",
+        cli_token: `${STATE_ID}.${encodeBase64Url(Uint8Array.from({ length: 32 }, () => 7))}`,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        flow_id: FLOW_ID,
+        state_id: STATE_ID,
+        status: "awaiting",
+      });
+    }
+    return jsonResponse(500, { error: { code: "unexpected" } });
+  };
+  const stdout: string[] = [];
+  const code = await runCli(
+    [
+      "auth",
+      "login",
+      "--json",
+      "--stop-after-qr",
+      "--print-url",
+      "--bff-url",
+      "https://pubky-marketplace-staging.vercel.app",
+      "--service-url",
+      origin,
+    ],
+    {
+      env: {
+        HOME: root,
+        XDG_CONFIG_HOME: path.join(root, "config"),
+        PUBKY_SHOP_CREDENTIAL_DIR: creds,
+      },
+      cwd: root,
+      stdout: {
+        write(chunk) {
+          stdout.push(String(chunk));
+          return true;
+        },
+      },
+      stderr: {
+        write() {
+          return true;
+        },
+      },
+      fetch: fetchImpl,
+      platform: "linux",
+      bindHomeserverSession: async (stored) => {
+        bound.push(stored.secret);
+        assert.equal(stored.pubky, PUBKY);
+        assert.equal(stored.secret, secret);
+        assert.deepEqual([...stored.capabilities], [HOMESERVER_CAPABILITY]);
+        return hs;
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.deepEqual(bound, [secret]);
+  assert.equal(hs.puts.length, 1);
+  const payload = JSON.parse(stdout.join("")) as { data: { status: string; pubky: string } };
+  assert.equal(payload.data.status, "awaiting_scan");
+  assert.equal(payload.data.pubky, PUBKY);
+});
+
+test("auth login with an unrestorable homeserver-session file is exit 2", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pubky-shop-cli-"));
+  const creds = path.join(root, "creds");
+  const origin = "https://marketplace-service-production.up.railway.app";
+  await filesystemHomeserverSessionStore(creds).put(origin, {
+    capabilities: [HOMESERVER_CAPABILITY],
+    pubky: PUBKY,
+    secret: "not-a-grant-secret",
+  });
+  const stdout: string[] = [];
+  const code = await runCli(
+    [
+      "auth",
+      "login",
+      "--json",
+      "--bff-url",
+      "https://pubky-marketplace-staging.vercel.app",
+      "--service-url",
+      origin,
+    ],
+    {
+      env: {
+        HOME: root,
+        XDG_CONFIG_HOME: path.join(root, "config"),
+        PUBKY_SHOP_CREDENTIAL_DIR: creds,
+      },
+      cwd: root,
+      stdout: {
+        write(chunk) {
+          stdout.push(String(chunk));
+          return true;
+        },
+      },
+      stderr: {
+        write() {
+          return true;
+        },
+      },
+      fetch: globalThis.fetch,
+      platform: "linux",
+    },
+  );
+  assert.equal(code, 2);
+  const payload = JSON.parse(stdout.join("")) as { error?: { code: string } };
+  assert.equal(payload.error?.code, "homeserver_session_invalid");
 });
 
 test("auth login without a homeserver session is exit 2", async () => {

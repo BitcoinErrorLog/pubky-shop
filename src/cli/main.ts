@@ -1,5 +1,10 @@
 import { parseArgs, resolveConfig, type FlagMap } from "./config.js";
-import { credentialStoreFor } from "./credentials.js";
+import {
+  credentialStoreFor,
+  homeserverSessionStoreFor,
+  loadStoredHomeserverSession,
+  type StoredHomeserverSession,
+} from "./credentials.js";
 import {
   CliError,
   EXIT_REMOTE,
@@ -20,11 +25,39 @@ export type CliIo = {
   readonly fetch: typeof fetch;
   readonly platform: string;
   readonly homeserverSession?: HomeserverSession;
+  readonly bindHomeserverSession?: (stored: StoredHomeserverSession) => Promise<HomeserverSession>;
   readonly signerApprove?: (authorizationUrl: string) => Promise<void>;
   readonly now?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly putListing?: (listingId: string, body: string) => Promise<void>;
 };
+
+async function resolveHomeserverSession(
+  io: CliIo,
+  serviceUrl: string,
+  configDir: string,
+  flags: FlagMap,
+): Promise<HomeserverSession | undefined> {
+  if (io.homeserverSession !== undefined) {
+    return io.homeserverSession;
+  }
+  if (flags.complete) {
+    return undefined;
+  }
+  const stored = await loadStoredHomeserverSession(
+    homeserverSessionStoreFor(io.env, configDir),
+    serviceUrl,
+    io.env,
+  );
+  if (stored === undefined) {
+    return undefined;
+  }
+  if (io.bindHomeserverSession !== undefined) {
+    return await io.bindHomeserverSession(stored);
+  }
+  const { restoreHomeserverSession } = await import("./homeserver.js");
+  return await restoreHomeserverSession(stored);
+}
 
 export async function runCli(argv: readonly string[], io: CliIo): Promise<ExitCode> {
   let flags: FlagMap | undefined;
@@ -32,6 +65,12 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<ExitCo
     const parsed = parseArgs(argv);
     flags = parsed.flags;
     const config = await resolveConfig(parsed.flags, io.env);
+    const homeserverSession = await resolveHomeserverSession(
+      io,
+      config.serviceUrl,
+      config.configDir,
+      parsed.flags,
+    );
     const ctx: CommandContext = {
       config,
       flags: parsed.flags,
@@ -39,7 +78,7 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<ExitCo
       fetch: io.fetch,
       platform: io.platform,
       store: credentialStoreFor(io.env, config.configDir),
-      ...(io.homeserverSession === undefined ? {} : { homeserverSession: io.homeserverSession }),
+      ...(homeserverSession === undefined ? {} : { homeserverSession }),
       ...(io.signerApprove === undefined ? {} : { signerApprove: io.signerApprove }),
       ...(io.now === undefined ? {} : { now: io.now }),
       ...(io.sleep === undefined ? {} : { sleep: io.sleep }),

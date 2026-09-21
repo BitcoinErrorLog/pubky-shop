@@ -248,11 +248,16 @@ tests) mints a staging seat, then calls `@synonymdev/pubky` 0.11
 `Signer.approveAuthRequest` on the `pubkyauth://signin_grant` URL so the SDK
 posts GrantClaims. `@synonymdev/pubky` 0.8 posts an AuthToken onto that inbox
 and the grant worker terminalizes `grant_invalid`. After approval, `auth login
---complete` tickets and claims the service bearer. Missing a homeserver session
-covering `/pub/pubky.app/marketplace/:rw` is exit 2. The bearer is stored on
-Darwin in keychain service `pubky-shop`, account `{origin}|{pubky}`, and
-otherwise under the config directory. Claim does not return a session id;
-`auth logout` requires `--force-local` unless a UUID session id is present.
+--complete` tickets and claims the service bearer. `auth login` loads a stored
+homeserver session covering `/pub/pubky.app/marketplace/:rw` from keychain
+service `pubky-shop`, account `{origin}|{pubky}|homeserver-session`, or from a
+mode-0600 file in `PUBKY_SHOP_CREDENTIAL_DIR` / the config credential
+directory. The payload is `{pubky,capabilities,secret}` where `secret` is
+`Session.exportLocalSecret()`. Missing that item is exit 2
+`homeserver_session_missing`. Unreadable or unrestorable material is exit 2
+`homeserver_session_invalid`. The marketplace bearer is a separate item,
+account `{origin}|{pubky}`. Claim does not return a session id; `auth logout`
+requires `--force-local` unless a UUID session id is present.
 
 ```sh
 PUBKY_SHOP_LIVE=1 npm test -- test/cli.live.test.ts

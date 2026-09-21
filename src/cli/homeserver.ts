@@ -1,8 +1,14 @@
 import { Keypair, PublicKey, Pubky, resolvePubky, type Session } from "@synonymdev/pubky";
 
 import { STAGING_HOMESERVER_Z32 } from "./config.js";
+import type { StoredHomeserverSession } from "./credentials.js";
 import { authError, remoteError } from "./exit.js";
-import { listingPath, type HomeserverPath, type HomeserverSession } from "./proof.js";
+import {
+  canonicalPubky,
+  listingPath,
+  type HomeserverPath,
+  type HomeserverSession,
+} from "./proof.js";
 
 export type ThrowawaySignup = {
   readonly session: HomeserverSession;
@@ -10,10 +16,11 @@ export type ThrowawaySignup = {
   readonly pubky: string;
   readonly clientFetch: (url: string, init?: RequestInit) => Promise<Response>;
   readonly stats: (path: HomeserverPath) => Promise<{ etag?: string } | undefined>;
+  exportSessionSecret(): Promise<string>;
   dispose(): void;
 };
 
-function wrapSession(session: Session): HomeserverSession {
+export function wrapSession(session: Session): HomeserverSession {
   return {
     pubky: session.info.publicKey.z32(),
     capabilities: [...session.info.capabilities],
@@ -24,6 +31,23 @@ function wrapSession(session: Session): HomeserverSession {
       await session.storage.delete(path);
     },
   };
+}
+
+export async function restoreHomeserverSession(
+  stored: StoredHomeserverSession,
+): Promise<HomeserverSession> {
+  let session: Session;
+  try {
+    session = await new Pubky().restoreSession(stored.secret);
+  } catch {
+    throw authError("homeserver_session_invalid", "stored homeserver session cannot be restored");
+  }
+  const wrapped = wrapSession(session);
+  if (canonicalPubky(wrapped.pubky) !== canonicalPubky(stored.pubky)) {
+    session.free();
+    throw authError("homeserver_session_invalid", "stored homeserver session pubky mismatch");
+  }
+  return wrapped;
 }
 
 export async function createThrowawayStagingSignup(signupToken: string): Promise<ThrowawaySignup> {
@@ -47,6 +71,9 @@ export async function createThrowawayStagingSignup(signupToken: string): Promise
         return undefined;
       }
       return { etag: stats.etag };
+    },
+    async exportSessionSecret() {
+      return await session.exportLocalSecret();
     },
     dispose() {
       session.free();
