@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdtempSync } from "node:fs";
 import {
   mkdir,
   readFile,
@@ -13,8 +14,10 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   FileManifestStore,
@@ -31,13 +34,19 @@ import {
 import { externalSortLines, minimumExternalSortWorkingSetBytes } from "../src/external-sort.js";
 import { sampleRow } from "./helpers.js";
 
-const evidenceRoot = "/Volumes/vibedrive/vibes-dev/.evidence/phase6/wave2/test-manifests";
+const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
+const lockWorkerPath = fileURLToPath(
+  new URL("../../test/manifest-lock-worker.mjs", import.meta.url),
+);
+const scratchRoot = mkdtempSync(join(tmpdir(), "pubky-shop-"));
 
 async function storeDirectory(): Promise<string> {
-  const directory = `${evidenceRoot}/${randomUUID()}`;
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  return directory;
+  return mkdtempSync(join(scratchRoot, "store-"));
 }
+
+test.after(async () => {
+  await rm(scratchRoot, { recursive: true, force: true });
+});
 
 async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {
   const values: T[] = [];
@@ -104,14 +113,10 @@ function streamedRows(rows: readonly ReturnType<typeof sampleRow>[]): AsyncItera
 
 async function runLockWorker(directory: string, manifestId: string): Promise<number> {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      [join(process.cwd(), "test/manifest-lock-worker.mjs"), directory, manifestId],
-      {
-        cwd: process.cwd(),
-        stdio: "ignore",
-      },
-    );
+    const child = spawn(process.execPath, [lockWorkerPath, directory, manifestId], {
+      cwd: repoRoot,
+      stdio: "ignore",
+    });
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (signal !== null || code === null) {

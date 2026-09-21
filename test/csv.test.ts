@@ -13,7 +13,7 @@ import { sampleRow } from "./helpers.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
-const goldenUrl = new URL("test/fixtures/csv/canonical.csv", `file://${process.cwd()}/`);
+const goldenUrl = new URL("../../test/fixtures/csv/canonical.csv", import.meta.url);
 
 function code(error: unknown, expected: string): boolean {
   return error instanceof PubkyShopError && error.code === expected;

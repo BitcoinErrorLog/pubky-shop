@@ -6,7 +6,7 @@ import test from "node:test";
 import { PubkyShopClient, PubkyShopError, type ServiceAuthTokenSigner } from "../src/index.js";
 import { SELLER_PUBKY } from "./helpers.js";
 
-const fixtureUrl = new URL("test/fixtures/service/inventory.json", `file://${process.cwd()}/`);
+const fixtureUrl = new URL("../../test/fixtures/service/inventory.json", import.meta.url);
 const fixtureBytes = await readFile(fixtureUrl);
 const fixture = JSON.parse(fixtureBytes.toString("utf8")) as {
   cases: Record<
