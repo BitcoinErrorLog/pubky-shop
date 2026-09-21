@@ -101,8 +101,7 @@ jobs:
             sed -i '/_authToken/d' "${NPM_CONFIG_USERCONFIG}"
           fi
           npm --version
-          # provenance requires a public source repo — re-enable when BitcoinErrorLog/pubky-shop is public
-          npm publish --access public
+          npm publish --access public --provenance
 
       - name: Verify published tarball
         shell: bash
