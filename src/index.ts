@@ -24,6 +24,7 @@ export {
   DEFAULT_CSV_STREAM_LIMITS,
   canonicalCsvRowIdentity,
   canonicalNestedColumns,
+  canonicalRowHashes,
   exportCanonicalCsv,
   listingIdentity,
   normalizedCsvRowHash,

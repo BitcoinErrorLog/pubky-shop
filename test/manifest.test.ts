@@ -33,7 +33,12 @@ import {
   replayImport,
   streamResumeTasks,
 } from "../src/node.js";
-import { externalSortLines, minimumExternalSortWorkingSetBytes } from "../src/external-sort.js";
+import {
+  BufferedUtf8Writer,
+  SPOOL_WRITE_BUFFER_BYTES,
+  externalSortLines,
+  minimumExternalSortWorkingSetBytes,
+} from "../src/external-sort.js";
 import { sampleRow } from "./helpers.js";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -507,6 +512,101 @@ test("changed replay never rewrites complete, conflict, or failed checkpoint his
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  }
+});
+
+test("BufferedUtf8Writer fsyncs committed files once and skips ephemeral spools", async () => {
+  function memoryHandle(): {
+    readonly syncs: () => number;
+    readonly bytes: () => Buffer;
+    readonly handle: ConstructorParameters<typeof BufferedUtf8Writer>[0];
+  } {
+    const chunks: Buffer[] = [];
+    let syncs = 0;
+    return {
+      syncs: () => syncs,
+      bytes: () => Buffer.concat(chunks),
+      handle: {
+        async write(buffer: Uint8Array, offset: number, length: number) {
+          chunks.push(Buffer.from(buffer.subarray(offset, offset + length)));
+          return { bytesWritten: length };
+        },
+        async sync() {
+          syncs += 1;
+        },
+      } as ConstructorParameters<typeof BufferedUtf8Writer>[0],
+    };
+  }
+
+  const durable = memoryHandle();
+  const durableWriter = new BufferedUtf8Writer(durable.handle, { durable: true });
+  await durableWriter.writeText("committed-row\n");
+  await durableWriter.finalize();
+  assert.equal(durable.syncs(), 1);
+  assert.equal(durable.bytes().toString("utf8"), "committed-row\n");
+
+  const ephemeral = memoryHandle();
+  const ephemeralWriter = new BufferedUtf8Writer(ephemeral.handle);
+  const payload = `${"x".repeat(SPOOL_WRITE_BUFFER_BYTES + 8)}\n`;
+  await ephemeralWriter.writeText(payload);
+  await ephemeralWriter.finalize();
+  assert.equal(ephemeral.syncs(), 0);
+  assert.equal(ephemeral.bytes().toString("utf8"), payload);
+});
+
+test("crash before sort and after identity sort leave no committed manifest", async () => {
+  for (const crashAt of [1, 2] as const) {
+    const directory = await storeDirectory();
+    try {
+      let verifies = 0;
+      const store = new FileManifestStore(directory, {
+        filesystemCheckpoint(operation) {
+          if (operation === "planning-verify") {
+            verifies += 1;
+            if (verifies === crashAt) {
+              throw new Error(`crash at planning-verify ${crashAt}`);
+            }
+          }
+        },
+      });
+      const result = await planImportStream(streamedCanonicalSource(8), {
+        store,
+        manifestId: `crash-verify-${crashAt}`,
+        limits: { maxWorkingSetBytes: 4 * 1024 * 1024 },
+        maxSortOpenFiles: 4,
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.error.code, "manifest_store_error");
+      }
+      assert.equal(await store.loadSummary(`crash-verify-${crashAt}`), null);
+      assert.deepEqual(
+        (await readdir(directory)).filter((name) => name.endsWith(".manifest.jsonl")),
+        [],
+      );
+      assert.ok(verifies >= crashAt);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("committed manifest data and directory entry survive a store reopen", async () => {
+  const directory = await storeDirectory();
+  try {
+    const store = new FileManifestStore(directory);
+    const planned = await planImport(exportCanonicalCsv([sampleRow()]), {
+      store,
+      manifestId: "durable-reopen",
+    });
+    assert.equal(planned.ok, true);
+    const reopened = new FileManifestStore(directory);
+    const loaded = await reopened.load("durable-reopen");
+    assert.equal(loaded?.manifestId, "durable-reopen");
+    assert.equal(loaded?.rowCount, 1);
+    assert.equal(loaded?.rows.length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
