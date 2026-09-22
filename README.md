@@ -335,9 +335,12 @@ npm run format:check
 npm run lint
 npm run typecheck
 npm test
+npm run test:full
 npm run build
 npm run pack:dry
 npm run gate
 ```
 
+`npm test` / `npm run gate` keep the 10k-row catalog that still spills to disk.
+`GATE_FULL=1 npm test` (or `npm run test:full`) adds the 100001-row catalog.
 `npm run pack:dry` validates package contents without publishing.

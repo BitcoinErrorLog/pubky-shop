@@ -7,11 +7,70 @@ import { PubkyShopError } from "./errors.js";
 
 export const EXTERNAL_SORT_STREAM_OVERHEAD_BYTES = 64 * 1024;
 export const DEFAULT_EXTERNAL_SORT_MAX_OPEN_FILES = 16;
+export const SPOOL_WRITE_BUFFER_BYTES = 64 * 1024;
 
 const ITERATOR_METADATA_BYTES = 256;
 const OUTPUT_METADATA_BYTES = 256;
 const PATH_METADATA_BYTES = 64;
 const MAX_MERGE_FAN_IN = 16;
+
+type FileHandle = Awaited<ReturnType<typeof open>>;
+
+/**
+ * 64 KiB spool writer. Callers that need a durable committed file pass
+ * `{ durable: true }` so the handle is fsync'd once after the last flush.
+ * Intermediate sort runs and planning spools only need the bytes in the
+ * kernel; a crash discards the workspace.
+ */
+export class BufferedUtf8Writer {
+  readonly #handle: FileHandle;
+  readonly #durable: boolean;
+  #chunks: Buffer[] = [];
+  #size = 0;
+
+  constructor(handle: FileHandle, options: { readonly durable?: boolean } = {}) {
+    this.#handle = handle;
+    this.#durable = options.durable === true;
+  }
+
+  async writeLine(line: string): Promise<void> {
+    await this.writeText(`${line}\n`);
+  }
+
+  async writeText(text: string): Promise<void> {
+    await this.writeBytes(Buffer.from(text, "utf8"));
+  }
+
+  async writeBytes(bytes: Uint8Array): Promise<void> {
+    this.#chunks.push(Buffer.from(bytes));
+    this.#size += bytes.byteLength;
+    if (this.#size >= SPOOL_WRITE_BUFFER_BYTES) {
+      await this.flush();
+    }
+  }
+
+  async flush(): Promise<void> {
+    const first = this.#chunks[0];
+    if (first === undefined || this.#size === 0) {
+      return;
+    }
+    const payload = this.#chunks.length === 1 ? first : Buffer.concat(this.#chunks, this.#size);
+    this.#chunks = [];
+    this.#size = 0;
+    let offset = 0;
+    while (offset < payload.byteLength) {
+      const result = await this.#handle.write(payload, offset, payload.byteLength - offset);
+      offset += result.bytesWritten;
+    }
+  }
+
+  async finalize(): Promise<void> {
+    await this.flush();
+    if (this.#durable) {
+      await this.#handle.sync();
+    }
+  }
+}
 
 export interface ExternalSortLimits {
   readonly maxLineBytes: number;
@@ -85,10 +144,11 @@ export async function* readBoundedLines(
 async function writeLines(path: string, lines: readonly string[]): Promise<void> {
   const handle = await open(path, "wx", 0o600);
   try {
+    const writer = new BufferedUtf8Writer(handle);
     for (const line of lines) {
-      await handle.writeFile(`${line}\n`);
+      await writer.writeLine(line);
     }
-    await handle.sync();
+    await writer.finalize();
   } finally {
     await handle.close();
   }
@@ -125,7 +185,12 @@ export function minimumExternalSortWorkingSetBytes(
   stem: string,
 ): number {
   const path = longestGeneratedPath(workspace, stem);
-  return OUTPUT_METADATA_BYTES + pathCharge(path) + streamCharge(path, maxLineBytes) * 2;
+  return (
+    OUTPUT_METADATA_BYTES +
+    SPOOL_WRITE_BUFFER_BYTES +
+    pathCharge(path) +
+    streamCharge(path, maxLineBytes) * 2
+  );
 }
 
 export function maximumExternalSortLineBytes(
@@ -136,6 +201,7 @@ export function maximumExternalSortLineBytes(
   const path = longestGeneratedPath(workspace, stem);
   const fixed =
     OUTPUT_METADATA_BYTES +
+    SPOOL_WRITE_BUFFER_BYTES +
     pathCharge(path) +
     (EXTERNAL_SORT_STREAM_OVERHEAD_BYTES + ITERATOR_METADATA_BYTES + pathCharge(path) + 16) * 2;
   return Math.floor((maxWorkingSetBytes - fixed) / 4);
@@ -163,10 +229,14 @@ async function mergeRuns(
       current[index] = item?.done === false ? item.value : undefined;
     }
     handle = await open(output, "wx", 0o600);
+    const writer = new BufferedUtf8Writer(handle);
     while (true) {
       let selected = -1;
       let selectedLine: string | undefined;
-      let charged = fixedMetadata + paths.length * EXTERNAL_SORT_STREAM_OVERHEAD_BYTES;
+      let charged =
+        fixedMetadata +
+        SPOOL_WRITE_BUFFER_BYTES +
+        paths.length * EXTERNAL_SORT_STREAM_OVERHEAD_BYTES;
       for (let index = 0; index < current.length; index += 1) {
         const line = current[index];
         if (line === undefined) {
@@ -185,11 +255,11 @@ async function mergeRuns(
       if (selected < 0 || selectedLine === undefined) {
         break;
       }
-      await handle.writeFile(`${selectedLine}\n`);
+      await writer.writeLine(selectedLine);
       const item = await iterators[selected]?.next();
       current[selected] = item?.done === false ? item.value : undefined;
     }
-    await handle.sync();
+    await writer.finalize();
   } finally {
     await handle?.close().catch(() => undefined);
     await Promise.all(iterators.map((iterator) => iterator.return?.(undefined)));
@@ -240,7 +310,8 @@ export async function externalSortLines(
     });
   }
   const longestPath = longestGeneratedPath(workspace, stem);
-  const fixedMergeBytes = OUTPUT_METADATA_BYTES + pathCharge(longestPath);
+  const fixedMergeBytes =
+    OUTPUT_METADATA_BYTES + SPOOL_WRITE_BUFFER_BYTES + pathCharge(longestPath);
   const perMergeInputBytes = streamCharge(longestPath, limits.maxLineBytes);
   const fanInByBytes = Math.floor(
     (limits.maxWorkingSetBytes - fixedMergeBytes) / perMergeInputBytes,
@@ -255,7 +326,8 @@ export async function externalSortLines(
 
   const inputFixedBytes =
     EXTERNAL_SORT_STREAM_OVERHEAD_BYTES + ITERATOR_METADATA_BYTES + pathCharge(input);
-  const outputFixedBytes = OUTPUT_METADATA_BYTES + pathCharge(longestPath);
+  const outputFixedBytes =
+    OUTPUT_METADATA_BYTES + SPOOL_WRITE_BUFFER_BYTES + pathCharge(longestPath);
   const runBudget = limits.maxWorkingSetBytes - inputFixedBytes - outputFixedBytes;
   if (runBudget < headCharge(limits.maxLineBytes)) {
     throw new PubkyShopError("invalid_configuration", {

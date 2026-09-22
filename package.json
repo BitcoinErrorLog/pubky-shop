@@ -44,10 +44,12 @@
     "build": "tsc -p tsconfig.build.json",
     "build:test": "tsc -p tsconfig.test.json",
     "test": "npm run build:test && node --test .test-dist/test/*.test.js",
+    "test:full": "npm run build:test && GATE_FULL=1 node --test .test-dist/test/*.test.js",
     "consumer:check": "npm run build && node test/consumer.mjs",
     "browser:check": "npm run build && node test/browser-entry.mjs",
     "pack:dry": "npm pack --dry-run --json",
-    "gate": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run consumer:check && npm run browser:check && npm run pack:dry"
+    "gate": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run consumer:check && npm run browser:check && npm run pack:dry",
+    "gate:full": "npm run format:check && npm run lint && npm run typecheck && npm run test:full && npm run consumer:check && npm run browser:check && npm run pack:dry"
   },
   "dependencies": {
     "@noble/curves": "2.3.0",
