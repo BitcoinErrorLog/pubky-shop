@@ -34,6 +34,8 @@ export class Sha256 {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
   ]);
   readonly #block = new Uint8Array(64);
+  readonly #blockView = new DataView(this.#block.buffer, this.#block.byteOffset, 64);
+  readonly #w = new Uint32Array(64);
   #blockOffset = 0;
   #bytes = 0n;
   #finalized = false;
@@ -50,7 +52,7 @@ export class Sha256 {
       this.#blockOffset += take;
       offset += take;
       if (this.#blockOffset === 64) {
-        this.#compress(this.#block);
+        this.#compress();
         this.#blockOffset = 0;
       }
     }
@@ -66,16 +68,15 @@ export class Sha256 {
     this.#blockOffset += 1;
     if (this.#blockOffset > 56) {
       this.#block.fill(0, this.#blockOffset);
-      this.#compress(this.#block);
+      this.#compress();
       this.#block.fill(0);
     } else {
       this.#block.fill(0, this.#blockOffset, 56);
     }
     const bitLength = this.#bytes << 3n;
-    const view = new DataView(this.#block.buffer, this.#block.byteOffset, 64);
-    view.setUint32(56, Number((bitLength >> 32n) & 0xffffffffn), false);
-    view.setUint32(60, Number(bitLength & 0xffffffffn), false);
-    this.#compress(this.#block);
+    this.#blockView.setUint32(56, Number((bitLength >> 32n) & 0xffffffffn), false);
+    this.#blockView.setUint32(60, Number(bitLength & 0xffffffffn), false);
+    this.#compress();
     const out = new Uint8Array(32);
     const outView = new DataView(out.buffer);
     for (let index = 0; index < 8; index += 1) {
@@ -88,9 +89,9 @@ export class Sha256 {
     return hexFromBytes(this.digest());
   }
 
-  #compress(block: Uint8Array): void {
-    const w = new Uint32Array(64);
-    const view = new DataView(block.buffer, block.byteOffset, 64);
+  #compress(): void {
+    const w = this.#w;
+    const view = this.#blockView;
     for (let index = 0; index < 16; index += 1) {
       w[index] = view.getUint32(index * 4, false);
     }

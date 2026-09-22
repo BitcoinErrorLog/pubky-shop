@@ -33,7 +33,12 @@ import {
   replayImport,
   streamResumeTasks,
 } from "../src/node.js";
-import { externalSortLines, minimumExternalSortWorkingSetBytes } from "../src/external-sort.js";
+import {
+  BufferedUtf8Writer,
+  SPOOL_WRITE_BUFFER_BYTES,
+  externalSortLines,
+  minimumExternalSortWorkingSetBytes,
+} from "../src/external-sort.js";
 import { sampleRow } from "./helpers.js";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -49,6 +54,8 @@ async function storeDirectory(): Promise<string> {
 test.after(async () => {
   await rm(scratchRoot, { recursive: true, force: true });
 });
+
+const GATE_FULL = process.env.GATE_FULL === "1";
 
 async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {
   const values: T[] = [];
@@ -508,6 +515,101 @@ test("changed replay never rewrites complete, conflict, or failed checkpoint his
   }
 });
 
+test("BufferedUtf8Writer fsyncs committed files once and skips ephemeral spools", async () => {
+  function memoryHandle(): {
+    readonly syncs: () => number;
+    readonly bytes: () => Buffer;
+    readonly handle: ConstructorParameters<typeof BufferedUtf8Writer>[0];
+  } {
+    const chunks: Buffer[] = [];
+    let syncs = 0;
+    return {
+      syncs: () => syncs,
+      bytes: () => Buffer.concat(chunks),
+      handle: {
+        async write(buffer: Uint8Array, offset: number, length: number) {
+          chunks.push(Buffer.from(buffer.subarray(offset, offset + length)));
+          return { bytesWritten: length };
+        },
+        async sync() {
+          syncs += 1;
+        },
+      } as ConstructorParameters<typeof BufferedUtf8Writer>[0],
+    };
+  }
+
+  const durable = memoryHandle();
+  const durableWriter = new BufferedUtf8Writer(durable.handle, { durable: true });
+  await durableWriter.writeText("committed-row\n");
+  await durableWriter.finalize();
+  assert.equal(durable.syncs(), 1);
+  assert.equal(durable.bytes().toString("utf8"), "committed-row\n");
+
+  const ephemeral = memoryHandle();
+  const ephemeralWriter = new BufferedUtf8Writer(ephemeral.handle);
+  const payload = `${"x".repeat(SPOOL_WRITE_BUFFER_BYTES + 8)}\n`;
+  await ephemeralWriter.writeText(payload);
+  await ephemeralWriter.finalize();
+  assert.equal(ephemeral.syncs(), 0);
+  assert.equal(ephemeral.bytes().toString("utf8"), payload);
+});
+
+test("crash before sort and after identity sort leave no committed manifest", async () => {
+  for (const crashAt of [1, 2] as const) {
+    const directory = await storeDirectory();
+    try {
+      let verifies = 0;
+      const store = new FileManifestStore(directory, {
+        filesystemCheckpoint(operation) {
+          if (operation === "planning-verify") {
+            verifies += 1;
+            if (verifies === crashAt) {
+              throw new Error(`crash at planning-verify ${crashAt}`);
+            }
+          }
+        },
+      });
+      const result = await planImportStream(streamedCanonicalSource(8), {
+        store,
+        manifestId: `crash-verify-${crashAt}`,
+        limits: { maxWorkingSetBytes: 4 * 1024 * 1024 },
+        maxSortOpenFiles: 4,
+      });
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.error.code, "manifest_store_error");
+      }
+      assert.equal(await store.loadSummary(`crash-verify-${crashAt}`), null);
+      assert.deepEqual(
+        (await readdir(directory)).filter((name) => name.endsWith(".manifest.jsonl")),
+        [],
+      );
+      assert.ok(verifies >= crashAt);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("committed manifest data and directory entry survive a store reopen", async () => {
+  const directory = await storeDirectory();
+  try {
+    const store = new FileManifestStore(directory);
+    const planned = await planImport(exportCanonicalCsv([sampleRow()]), {
+      store,
+      manifestId: "durable-reopen",
+    });
+    assert.equal(planned.ok, true);
+    const reopened = new FileManifestStore(directory);
+    const loaded = await reopened.load("durable-reopen");
+    assert.equal(loaded?.manifestId, "durable-reopen");
+    assert.equal(loaded?.rowCount, 1);
+    assert.equal(loaded?.rows.length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("late malformed stream leaves no committed manifest or planning spool", async () => {
   const directory = await storeDirectory();
   try {
@@ -662,13 +764,27 @@ test("stream planner accepts a source over 64 MiB with asserted bounded buffers"
   }
 });
 
-test("100001-row manifest checkpoints resumes and replays without materialization", async (t) => {
+test("10000-row manifest checkpoints resumes and replays without materialization", async (t) => {
+  await assertCatalogOperable(t, 10_000, "large-operable");
+});
+
+test("100001-row manifest checkpoints resumes and replays without materialization", {
+  skip: GATE_FULL ? false : "set GATE_FULL=1",
+}, async (t) => {
+  await assertCatalogOperable(t, 100_001, "large-operable-full");
+});
+
+async function assertCatalogOperable(
+  t: { diagnostic: (message: string) => void },
+  rowCount: number,
+  manifestId: string,
+): Promise<void> {
   const directory = await storeDirectory();
   try {
     const store = new FileManifestStore(directory);
-    const planned = await planImportStream(streamedCanonicalSource(100_001), {
+    const planned = await planImportStream(streamedCanonicalSource(rowCount), {
       store,
-      manifestId: "large-operable",
+      manifestId,
       now: () => new Date("2026-09-19T10:00:00.000Z"),
       limits: { maxWorkingSetBytes: 4 * 1024 * 1024 },
       maxSortOpenFiles: 4,
@@ -677,25 +793,32 @@ test("100001-row manifest checkpoints resumes and replays without materializatio
     if (!planned.ok) {
       return;
     }
-    assert.equal(planned.value.manifest.rowCount, 100_001);
-    await assert.rejects(
-      () => store.load("large-operable"),
-      (error: unknown) => error instanceof PubkyShopError && error.code === "limit_exceeded",
+    assert.equal(planned.value.manifest.rowCount, rowCount);
+    assert.ok(planned.value.resourceUsage.peakPlannerOpenFiles >= 3);
+    assert.ok(
+      planned.value.resourceUsage.peakPlannerBufferedBytes <=
+        planned.value.resourceUsage.maxWorkingSetBytes,
     );
+    if (rowCount > 100_000) {
+      await assert.rejects(
+        () => store.load(manifestId),
+        (error: unknown) => error instanceof PubkyShopError && error.code === "limit_exceeded",
+      );
+    }
 
     let firstRow:
       | {
           readonly rowIdentity: string;
         }
       | undefined;
-    for await (const row of store.streamRows("large-operable")) {
+    for await (const row of store.streamRows(manifestId)) {
       firstRow = row;
       break;
     }
     assert.ok(firstRow);
     const checkpoint = await checkpointImportRow(
       store,
-      "large-operable",
+      manifestId,
       1,
       firstRow.rowIdentity,
       "publishing",
@@ -708,16 +831,16 @@ test("100001-row manifest checkpoints resumes and replays without materializatio
 
     let resumeCount = 0;
     let reconcileCount = 0;
-    for await (const task of streamResumeTasks(store, "large-operable")) {
+    for await (const task of streamResumeTasks(store, manifestId)) {
       resumeCount += 1;
       if (task.next === "reconcile_publish") {
         reconcileCount += 1;
       }
     }
-    assert.equal(resumeCount, 100_001);
+    assert.equal(resumeCount, rowCount);
     assert.equal(reconcileCount, 1);
 
-    const same = await replayImport(store, "large-operable", streamedCanonicalSource(100_001), {
+    const same = await replayImport(store, manifestId, streamedCanonicalSource(rowCount), {
       limits: { maxWorkingSetBytes: 4 * 1024 * 1024 },
       maxSortOpenFiles: 4,
     });
@@ -726,7 +849,7 @@ test("100001-row manifest checkpoints resumes and replays without materializatio
       return;
     }
     assert.equal(same.value.kind, "same");
-    assert.equal(same.value.resourceUsage.rowCount, 100_001);
+    assert.equal(same.value.resourceUsage.rowCount, rowCount);
     assert.ok(
       same.value.resourceUsage.peakPlannerMetadataBytes <=
         same.value.resourceUsage.maxWorkingSetBytes,
@@ -740,8 +863,8 @@ test("100001-row manifest checkpoints resumes and replays without materializatio
 
     const changed = await replayImport(
       store,
-      "large-operable",
-      streamedCanonicalSource(100_001, 50_000),
+      manifestId,
+      streamedCanonicalSource(rowCount, Math.floor(rowCount / 2)),
       {
         limits: { maxWorkingSetBytes: 4 * 1024 * 1024 },
         maxSortOpenFiles: 4,
@@ -767,18 +890,18 @@ test("100001-row manifest checkpoints resumes and replays without materializatio
     assert.equal(
       (
         await collect(
-          store.streamReplayConflicts("large-operable", changed.value.quarantine.quarantineId),
+          store.streamReplayConflicts(manifestId, changed.value.quarantine.quarantineId),
         )
       )[0]?.reason,
       "changed_hash",
     );
     t.diagnostic(
-      `rows=${resumeCount} checkpointVersion=${checkpoint.value.manifest.manifestVersion} replayParserPeak=${same.value.resourceUsage.peakParserBufferedBytes} replayPlannerPeak=${same.value.resourceUsage.peakPlannerBufferedBytes} replayMetadataPeak=${same.value.resourceUsage.peakPlannerMetadataBytes} replayFdPeak=${same.value.resourceUsage.peakPlannerOpenFiles} bound=${same.value.resourceUsage.maxWorkingSetBytes}`,
+      `rows=${resumeCount} checkpointVersion=${checkpoint.value.manifest.manifestVersion} plannerFdPeak=${planned.value.resourceUsage.peakPlannerOpenFiles} replayParserPeak=${same.value.resourceUsage.peakParserBufferedBytes} replayPlannerPeak=${same.value.resourceUsage.peakPlannerBufferedBytes} replayMetadataPeak=${same.value.resourceUsage.peakPlannerMetadataBytes} replayFdPeak=${same.value.resourceUsage.peakPlannerOpenFiles} bound=${same.value.resourceUsage.maxWorkingSetBytes}`,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
-});
+}
 
 test("stream planning produces byte-identical deterministic manifests", async () => {
   const left = await storeDirectory();

@@ -6,9 +6,8 @@ import {
   DEFAULT_CSV_LIMITS,
   DEFAULT_CSV_STREAM_LIMITS,
   canonicalCsvRowIdentity,
+  canonicalRowHashes,
   listingIdentity,
-  normalizedCsvRowHash,
-  normalizedListingFactsHash,
   parseCanonicalCsvStream,
 } from "./csv.js";
 import { ERROR_CODES, type ErrorCode, PubkyShopError, type SdkResult, err, ok } from "./errors.js";
@@ -384,11 +383,14 @@ class IdentityIndex {
     return this.#bytes;
   }
 
-  add(row: CanonicalCsvRow, normalizedHash: string): void {
+  add(
+    row: CanonicalCsvRow,
+    hashes: { readonly normalizedHash: string; readonly listingFactsHash: string },
+  ): void {
     const sourceRow = row.sourceRow ?? 0;
     const identity = listingIdentity(row);
     const variantIdentity = `${identity}#${row.variantId}`;
-    const facts = normalizedListingFactsHash(row);
+    const { normalizedHash, listingFactsHash: facts } = hashes;
     const priorHash = this.#hashes.get(normalizedHash);
     if (priorHash !== undefined) {
       throw new PubkyShopError("duplicate_row", { sourceRow });
@@ -692,8 +694,9 @@ async function planCanonicalRows(
   let generatedForListing: string | null = null;
   try {
     for (const row of rows) {
-      const normalizedHash = normalizedCsvRowHash(row);
-      index.add(row, normalizedHash);
+      const hashes = canonicalRowHashes(row);
+      const { normalizedHash } = hashes;
+      index.add(row, hashes);
       const identity = listingIdentity(row);
       if (identity !== priorListingIdentity) {
         priorListingIdentity = identity;

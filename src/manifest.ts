@@ -9,8 +9,7 @@ import {
   type CsvStreamLimits,
   canonicalCsvRowIdentity,
   listingIdentity,
-  normalizedListingFactsHash,
-  normalizedCsvRowHash,
+  canonicalRowHashes,
   parseCanonicalCsvStream,
 } from "./csv.js";
 import { ERROR_CODES, type ErrorCode, PubkyShopError, type SdkResult, err, ok } from "./errors.js";
@@ -23,6 +22,7 @@ import {
 } from "./json.js";
 import {
   DEFAULT_EXTERNAL_SORT_MAX_OPEN_FILES,
+  BufferedUtf8Writer,
   externalSortLines,
   maximumExternalSortLineBytes,
   readBoundedLines,
@@ -808,7 +808,6 @@ export class FileManifestStore implements StreamingManifestStore {
           expected = parseSummaryLine(line).rowCount;
           first = false;
         } else {
-          parsePlannedRowLine(line);
           observed += 1;
         }
       }
@@ -1609,17 +1608,18 @@ export class FileManifestStore implements StreamingManifestStore {
     try {
       await this.#verifyRoot(root, summary.manifestId);
       handle = await open(temporary, CREATE_EXCLUSIVE_NOFOLLOW, 0o600);
-      await handle.writeFile(encodeCanonicalJson(summary as unknown as JsonObject));
+      const writer = new BufferedUtf8Writer(handle, { durable: true });
+      await writer.writeBytes(encodeCanonicalJson(summary as unknown as JsonObject));
       let count = 0;
       for await (const line of rowLines) {
         const row = parsePlannedRowLine(line);
-        await handle.writeFile(encodeCanonicalJson(row as unknown as JsonObject));
+        await writer.writeBytes(encodeCanonicalJson(row as unknown as JsonObject));
         count += 1;
       }
       if (count !== summary.rowCount) {
         throw new PubkyShopError("manifest_store_error", { manifestId: summary.manifestId });
       }
-      await handle.sync();
+      await writer.finalize();
       await handle.close();
       handle = undefined;
       await this.#installFinal(root, path, temporary, summary.manifestId, expectedFinal);
@@ -1691,19 +1691,20 @@ export class FileManifestStore implements StreamingManifestStore {
     let handle: FileHandle | undefined;
     try {
       handle = await open(temporary, CREATE_EXCLUSIVE_NOFOLLOW, 0o600);
+      const writer = new BufferedUtf8Writer(handle, { durable: true });
       const hash = createHash("sha256");
       let count = 0;
       for await (const line of readBoundedLines(conflictsPath, CONFLICT_LINE_BYTES)) {
         const conflict = parseConflictLine(line);
         const encoded = encodeCanonicalJson(conflict as unknown as JsonObject);
         hash.update(encoded);
-        await handle.writeFile(encoded);
+        await writer.writeBytes(encoded);
         count += 1;
       }
       if (count !== record.conflictCount || hash.digest("hex") !== record.conflictHash) {
         throw new PubkyShopError("manifest_store_error", { manifestId: record.manifestId });
       }
-      await handle.sync();
+      await writer.finalize();
       await handle.close();
       handle = undefined;
       await this.#installFinal(root, finalPath, temporary, record.manifestId);
@@ -1933,9 +1934,21 @@ async function validateIdentityIndex(path: string, maxLineBytes: number): Promis
   }
 }
 
-function decodeCanonicalRow(line: string, maxCanonicalJsonBytes: number): CanonicalCsvRow {
-  const [, , , , encoded] = splitSpoolLine(line, 5);
-  if (encoded === undefined) {
+function decodeCanonicalRow(
+  line: string,
+  maxCanonicalJsonBytes: number,
+): {
+  readonly row: CanonicalCsvRow;
+  readonly normalizedHash: string;
+} {
+  const parts = splitSpoolLine(line, 5);
+  const encodedHash = parts[3];
+  const encoded = parts[4];
+  if (encodedHash === undefined || encoded === undefined) {
+    throw new PubkyShopError("manifest_store_error");
+  }
+  const normalizedHash = unbase64(encodedHash);
+  if (!hashPattern.test(normalizedHash)) {
     throw new PubkyShopError("manifest_store_error");
   }
   const value = parseBoundedJson(unbase64(encoded), {
@@ -1947,7 +1960,7 @@ function decodeCanonicalRow(line: string, maxCanonicalJsonBytes: number): Canoni
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new PubkyShopError("manifest_store_error");
   }
-  return value as unknown as CanonicalCsvRow;
+  return { row: value as unknown as CanonicalCsvRow, normalizedHash };
 }
 
 interface InternalPlanCaps {
@@ -1988,8 +2001,10 @@ async function planImportStreamInternal(
     }
     const maxCanonicalJsonBytes = Math.max(1, Math.floor((maxSpoolLineBytes - 16 * 1024) * 0.72));
     const maxGeneratedLineBytes = Math.min(16 * 1024, maxSpoolLineBytes);
-    const rawRows = await open(rawRowsPath, "wx", 0o600);
-    const identityIndex = await open(identityIndexPath, "wx", 0o600);
+    const rawRowsHandle = await open(rawRowsPath, "wx", 0o600);
+    const identityIndexHandle = await open(identityIndexPath, "wx", 0o600);
+    const rawRows = new BufferedUtf8Writer(rawRowsHandle);
+    const identityIndex = new BufferedUtf8Writer(identityIndexHandle);
     let peakPlannerBufferedBytes = 0;
     let peakPlannerMetadataBytes = 0;
     let peakPlannerOpenFiles = 2;
@@ -2000,7 +2015,7 @@ async function planImportStreamInternal(
         source,
         async (row) => {
           boundedRowCount += 1;
-          const normalizedHash = normalizedCsvRowHash(row);
+          const hashes = canonicalRowHashes(row);
           const identity = listingIdentity(row);
           const variantIdentity = `${identity}#${row.variantId}`;
           const rowJson = canonicalJson(row as unknown as JsonObject);
@@ -2014,12 +2029,12 @@ async function planImportStreamInternal(
           }
           const rawLine = `${base64(identity)}\t${base64(row.variantId)}\t${base64(
             row.sku,
-          )}\t${base64(normalizedHash)}\t${base64(rowJson)}`;
+          )}\t${base64(hashes.normalizedHash)}\t${base64(rowJson)}`;
           const sourceRow = row.sourceRow ?? 0;
           const lines = [
-            indexLine("H", normalizedHash, variantIdentity, sourceRow),
-            indexLine("V", variantIdentity, normalizedHash, sourceRow),
-            indexLine("L", identity, normalizedListingFactsHash(row), sourceRow),
+            indexLine("H", hashes.normalizedHash, variantIdentity, sourceRow),
+            indexLine("V", variantIdentity, hashes.normalizedHash, sourceRow),
+            indexLine("L", identity, hashes.listingFactsHash, sourceRow),
             ...(row.sku === "" ? [] : [indexLine("S", row.sku, variantIdentity, sourceRow)]),
           ];
           if (
@@ -2046,9 +2061,9 @@ async function planImportStreamInternal(
               sourceRow,
             });
           }
-          await rawRows.writeFile(`${rawLine}\n`);
+          await rawRows.writeLine(rawLine);
           for (const item of lines) {
-            await identityIndex.writeFile(`${item}\n`);
+            await identityIndex.writeLine(item);
           }
           if (caps.maxRows !== undefined && boundedRowCount > caps.maxRows) {
             throw new PubkyShopError("limit_exceeded", {
@@ -2061,11 +2076,11 @@ async function planImportStreamInternal(
         },
         options.limits,
       );
-      await rawRows.sync();
-      await identityIndex.sync();
+      await rawRows.finalize();
+      await identityIndex.finalize();
     } finally {
-      await rawRows.close();
-      await identityIndex.close();
+      await rawRowsHandle.close();
+      await identityIndexHandle.close();
     }
     await workspace.verify();
     if (parsed === undefined) {
@@ -2116,14 +2131,17 @@ async function planImportStreamInternal(
 
     const plannedPath = join(workspace.directory, "planned-rows.spool");
     const generatedIndexPath = join(workspace.directory, "generated-index.spool");
-    const planned = await open(plannedPath, "wx", 0o600);
-    const generatedIndex = await open(generatedIndexPath, "wx", 0o600);
+    const plannedHandle = await open(plannedPath, "wx", 0o600);
+    const generatedIndexHandle = await open(generatedIndexPath, "wx", 0o600);
+    const planned = new BufferedUtf8Writer(plannedHandle);
+    const generatedIndex = new BufferedUtf8Writer(generatedIndexHandle);
     let priorListingIdentity = "";
     let generatedForListing: string | null = null;
     let rowCount = 0;
     try {
       for await (const line of readBoundedLines(canonicalSorted.path, maxSpoolLineBytes)) {
-        const row = decodeCanonicalRow(line, maxCanonicalJsonBytes);
+        const decoded = decodeCanonicalRow(line, maxCanonicalJsonBytes);
+        const row = decoded.row;
         const identity = listingIdentity(row);
         if (identity !== priorListingIdentity) {
           priorListingIdentity = identity;
@@ -2148,10 +2166,10 @@ async function planImportStreamInternal(
                 ...(row.sourceRow === undefined ? {} : { sourceRow: row.sourceRow }),
               });
             }
-            await generatedIndex.writeFile(`${generatedLine}\n`);
+            await generatedIndex.writeLine(generatedLine);
           }
         }
-        const normalizedHash = normalizedCsvRowHash(row);
+        const normalizedHash = decoded.normalizedHash;
         const rowIdentity = canonicalCsvRowIdentity(row);
         const intendedAction = actionFor(row, normalizedHash, options.currentItems ?? {});
         const plannedRow: PlannedImportRow = {
@@ -2181,14 +2199,14 @@ async function planImportStreamInternal(
             ...(row.sourceRow === undefined ? {} : { sourceRow: row.sourceRow }),
           });
         }
-        await planned.writeFile(`${rendered}\n`);
+        await planned.writeLine(rendered);
         rowCount += 1;
       }
-      await planned.sync();
-      await generatedIndex.sync();
+      await planned.finalize();
+      await generatedIndex.finalize();
     } finally {
-      await planned.close();
-      await generatedIndex.close();
+      await plannedHandle.close();
+      await generatedIndexHandle.close();
     }
     await workspace.verify();
 
@@ -2499,8 +2517,10 @@ export async function replayImport(
       });
     }
 
-    const replayRows = await open(replayRowsPath, "wx", 0o600);
-    const replayIdentity = await open(replayIdentityPath, "wx", 0o600);
+    const replayRowsHandle = await open(replayRowsPath, "wx", 0o600);
+    const replayIdentityHandle = await open(replayIdentityPath, "wx", 0o600);
+    const replayRows = new BufferedUtf8Writer(replayRowsHandle);
+    const replayIdentity = new BufferedUtf8Writer(replayIdentityHandle);
     let parsed: Awaited<ReturnType<typeof parseCanonicalCsvStream>>;
     try {
       parsed = await parseCanonicalCsvStream(
@@ -2510,11 +2530,12 @@ export async function replayImport(
           const rowIdentity = canonicalCsvRowIdentity(row);
           const variantIdentity = `${identity}#${row.variantId}`;
           const sourceRow = row.sourceRow ?? 0;
-          const index = replayIndexLine(rowIdentity, normalizedCsvRowHash(row), sourceRow);
+          const hashes = canonicalRowHashes(row);
+          const index = replayIndexLine(rowIdentity, hashes.normalizedHash, sourceRow);
           const identityLines = [
-            indexLine("H", normalizedCsvRowHash(row), variantIdentity, sourceRow),
-            indexLine("V", variantIdentity, normalizedCsvRowHash(row), sourceRow),
-            indexLine("L", identity, normalizedListingFactsHash(row), sourceRow),
+            indexLine("H", hashes.normalizedHash, variantIdentity, sourceRow),
+            indexLine("V", variantIdentity, hashes.normalizedHash, sourceRow),
+            indexLine("L", identity, hashes.listingFactsHash, sourceRow),
             ...(row.sku === "" ? [] : [indexLine("S", row.sku, variantIdentity, sourceRow)]),
           ];
           if (
@@ -2528,18 +2549,18 @@ export async function replayImport(
               sourceRow,
             });
           }
-          await replayRows.writeFile(`${index}\n`);
+          await replayRows.writeLine(index);
           for (const line of identityLines) {
-            await replayIdentity.writeFile(`${line}\n`);
+            await replayIdentity.writeLine(line);
           }
         },
         options.limits,
       );
-      await replayRows.sync();
-      await replayIdentity.sync();
+      await replayRows.finalize();
+      await replayIdentity.finalize();
     } finally {
-      await replayRows.close();
-      await replayIdentity.close();
+      await replayRowsHandle.close();
+      await replayIdentityHandle.close();
     }
     await workspace.verify();
 
@@ -2572,16 +2593,17 @@ export async function replayImport(
     );
     await workspace.verify();
 
-    const manifestRows = await open(manifestRowsPath, "wx", 0o600);
+    const manifestRowsHandle = await open(manifestRowsPath, "wx", 0o600);
+    const manifestRows = new BufferedUtf8Writer(manifestRowsHandle);
     try {
       for await (const row of store.streamRows(manifestId)) {
-        await manifestRows.writeFile(
-          `${replayIndexLine(row.rowIdentity, row.normalizedHash, row.sourceRow)}\n`,
+        await manifestRows.writeLine(
+          replayIndexLine(row.rowIdentity, row.normalizedHash, row.sourceRow),
         );
       }
-      await manifestRows.sync();
+      await manifestRows.finalize();
     } finally {
-      await manifestRows.close();
+      await manifestRowsHandle.close();
     }
     await workspace.verify();
     const manifestSorted = await externalSortLines(
@@ -2606,7 +2628,8 @@ export async function replayImport(
     ]();
     let replayItem = await replayIterator.next();
     let manifestItem = await manifestIterator.next();
-    const conflictOutput = await open(conflictsPath, "wx", 0o600);
+    const conflictOutputHandle = await open(conflictsPath, "wx", 0o600);
+    const conflictOutput = new BufferedUtf8Writer(conflictOutputHandle);
     const conflictHash = createHash("sha256");
     let conflictCount = 0;
     try {
@@ -2652,12 +2675,12 @@ export async function replayImport(
           throw new PubkyShopError("manifest_store_error", { manifestId });
         }
         conflictHash.update(encoded);
-        await conflictOutput.writeFile(encoded);
+        await conflictOutput.writeBytes(encoded);
         conflictCount += 1;
       }
-      await conflictOutput.sync();
+      await conflictOutput.finalize();
     } finally {
-      await conflictOutput.close();
+      await conflictOutputHandle.close();
       await replayIterator.return?.(undefined);
       await manifestIterator.return?.(undefined);
     }

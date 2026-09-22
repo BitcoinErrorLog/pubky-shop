@@ -879,27 +879,37 @@ function canonicalCells(row: CanonicalCsvRow): Readonly<Record<CanonicalCsvColum
   };
 }
 
-export function normalizedListingFactsHash(row: CanonicalCsvRow): string {
+export function canonicalRowHashes(row: CanonicalCsvRow): {
+  readonly normalizedHash: string;
+  readonly listingFactsHash: string;
+} {
   const cells = canonicalCells(row);
-  return sha256Hex(
-    encoder.encode(
-      canonicalJson(Object.fromEntries(LISTING_COLUMNS.map((column) => [column, cells[column]]))),
-    ),
-  );
-}
-
-export function normalizedCsvRowHash(row: CanonicalCsvRow): string {
   const extra = Object.fromEntries(
     Object.entries(row.extraFields).sort(([left], [right]) => compareText(left, right)),
   );
-  return sha256Hex(
-    encoder.encode(
-      canonicalJson({
-        ...canonicalCells(row),
-        extra,
-      }),
+  return {
+    listingFactsHash: sha256Hex(
+      encoder.encode(
+        canonicalJson(Object.fromEntries(LISTING_COLUMNS.map((column) => [column, cells[column]]))),
+      ),
     ),
-  );
+    normalizedHash: sha256Hex(
+      encoder.encode(
+        canonicalJson({
+          ...cells,
+          extra,
+        }),
+      ),
+    ),
+  };
+}
+
+export function normalizedListingFactsHash(row: CanonicalCsvRow): string {
+  return canonicalRowHashes(row).listingFactsHash;
+}
+
+export function normalizedCsvRowHash(row: CanonicalCsvRow): string {
+  return canonicalRowHashes(row).normalizedHash;
 }
 
 function validateRows(rows: readonly CanonicalCsvRow[]): void {
@@ -909,13 +919,13 @@ function validateRows(rows: readonly CanonicalCsvRow[]): void {
   const listingFacts = new Map<string, string>();
   for (const row of rows) {
     validateIdentity(row);
-    const hash = normalizedCsvRowHash(row);
-    if (rowHashes.has(hash)) {
+    const hash = canonicalRowHashes(row);
+    if (rowHashes.has(hash.normalizedHash)) {
       throw new PubkyShopError("duplicate_row", {
         ...(row.sourceRow === undefined ? {} : { sourceRow: row.sourceRow }),
       });
     }
-    rowHashes.add(hash);
+    rowHashes.add(hash.normalizedHash);
     const identity = listingIdentity(row);
     const variantIdentity = `${identity}#${row.variantId}`;
     if (variants.has(variantIdentity)) {
@@ -933,14 +943,13 @@ function validateRows(rows: readonly CanonicalCsvRow[]): void {
       }
       skus.set(row.sku, variantIdentity);
     }
-    const facts = normalizedListingFactsHash(row);
-    const priorFacts = listingFacts.get(identity);
-    if (priorFacts !== undefined && priorFacts !== facts) {
+    const facts = listingFacts.get(identity);
+    if (facts !== undefined && facts !== hash.listingFactsHash) {
       throw new PubkyShopError("conflicting_listing_fields", {
         ...(row.sourceRow === undefined ? {} : { sourceRow: row.sourceRow }),
       });
     }
-    listingFacts.set(identity, facts);
+    listingFacts.set(identity, hash.listingFactsHash);
   }
 }
 
