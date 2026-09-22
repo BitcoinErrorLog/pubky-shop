@@ -1,6 +1,6 @@
 {
   "name": "@bitcoinerrorlog/pubky-shop",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Typed Pubky Shop inventory SDK, deterministic import/export codecs, and seller CLI",
   "license": "MIT",
   "type": "module",

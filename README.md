@@ -56,7 +56,8 @@ from any homeserver credential.
 
 `getInventoryProjection(aggregateId)` and `adjustInventory(request)` return
 `SdkResult<T>`. They decode the generated Wave 1 contract while preserving
-unknown response fields for forward compatibility. Wave 3a seller HTTP is on
+unknown response fields for forward compatibility. The client binds `fetch` to
+the global object so Chromium `Window.fetch` is not invoked as a method. Wave 3a seller HTTP is on
 the same class: `listings`, `orders`, `events`, `getListing`, `syncMany`
 (chunks of 100), webhooks, and sessions. `createSession` POSTs AuthToken bytes
 as `application/octet-stream` and does not attach an existing bearer. Wave 1 Rust `i64` fields

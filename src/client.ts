@@ -450,7 +450,9 @@ export class PubkyShopClient {
     }
     this.#origin = serviceUrl.origin;
     this.#session = config.session;
-    this.#fetch = config.fetch ?? globalThis.fetch;
+    // Chromium Window.fetch throws Illegal invocation unless `this` is Window.
+    // Method-call `this.#fetch(...)` would bind `this` to the client.
+    this.#fetch = (config.fetch ?? globalThis.fetch).bind(globalThis);
     this.#maxResponseBytes = maximum;
   }
 
