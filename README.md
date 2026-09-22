@@ -6,16 +6,22 @@ ESM-only, requires Node 22 or newer, and is not published by this repository.
 
 ## Package exports
 
-- `.` is the browser-safe entry: codecs plus `PubkyShopClient` (Wave 1 inventory
-  and Wave 3a HTTP). It hashes with Web Crypto-compatible SHA-256 and never
+- `.` is the browser-safe entry: codecs, `PubkyShopClient` (Wave 1 inventory
+  and Wave 3a HTTP), and the in-memory import planner (`planImport`,
+  `planImportStream`, `MemoryManifestStore`, `resumeTasks`, chunked
+  `sync-many` helpers). It hashes with Web Crypto-compatible SHA-256 and never
   imports `node:` or `@synonymdev/pubky`.
-- `./node` is the Node planner: `FileManifestStore`, `planImport`,
-  `planImportStream`, `resumeTasks`, and `streamResumeTasks`.
+- `./node` is the Node spool planner: `FileManifestStore`, disk-backed
+  `planImport` / `planImportStream`, `resumeTasks`, and `streamResumeTasks`.
 - `@synonymdev/pubky` is an optional peer used only by the CLI / `./node`.
 
 ```ts
-import { PubkyShopClient } from "@bitcoinerrorlog/pubky-shop";
-import { FileManifestStore, planImport } from "@bitcoinerrorlog/pubky-shop/node";
+import {
+  MemoryManifestStore,
+  PubkyShopClient,
+  planImport,
+} from "@bitcoinerrorlog/pubky-shop";
+import { FileManifestStore, planImport as planImportNode } from "@bitcoinerrorlog/pubky-shop/node";
 ```
 
 ## Credential ownership
@@ -136,13 +142,38 @@ and exporter additionally retain explicit total byte/row caps.
 
 ## Durable import planning
 
+Browser hosts plan against an in-memory `ManifestStore` (Shop supplies Dexie):
+
+```ts
+import {
+  MemoryManifestStore,
+  browserFileSource,
+  planImportStream,
+  resumeTasks,
+} from "@bitcoinerrorlog/pubky-shop";
+
+const store = new MemoryManifestStore();
+const planned = await planImportStream(browserFileSource(file), { store });
+```
+
+`planImport` / `planImportStream` on `.` stream-parse with Web APIs, bound the
+working set (64 MiB convenience / parser-planner bytes), and call `store.create`
+only after EOF, UTF-8/CSV/JSON/mapping validation, identity-index checks, and
+source SHA-256 completion. Parse failure leaves zero rows. JSON is a bounded
+convenience path (`[{…}]` or `{rows:[…]}`); CSV is streamed. Idempotency keys
+are UUID v5-like from SHA-256 of schema, manifest id, row identity, and
+normalized hash — the same bytes as the Node planner. `chunkSyncManyListings`
+splits publish batches at 100. `classifySyncManyItem` reads per-id 207 results.
+
+Node hosts keep the disk spool planner:
+
 ```ts
 import {
   FileManifestStore,
   planImportStream,
   replayImport,
   resumeTasks,
-} from "@bitcoinerrorlog/pubky-shop";
+} from "@bitcoinerrorlog/pubky-shop/node";
 
 const store = new FileManifestStore("/secure/host-owned/import-manifests");
 const planned = await planImportStream(fileReadable, { store });

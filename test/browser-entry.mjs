@@ -68,8 +68,13 @@ await rm(browserRoot, { recursive: true, force: true });
 
 const sdk = await import("../dist/index.js");
 assert.equal(typeof sdk.PubkyShopClient, "function");
-assert.equal(sdk.planImport, undefined);
-assert.equal(sdk.planImportStream, undefined);
+assert.equal(typeof sdk.planImport, "function");
+assert.equal(typeof sdk.planImportStream, "function");
+assert.equal(typeof sdk.MemoryManifestStore, "function");
+assert.equal(typeof sdk.chunkSyncManyListings, "function");
+assert.equal(typeof sdk.classifySyncManyItem, "function");
+assert.equal(typeof sdk.resumeTasks, "function");
+assert.equal(typeof sdk.browserFileSource, "function");
 assert.equal(sdk.FileManifestStore, undefined);
 assert.equal(typeof sdk.sha256Hex, "function");
 
