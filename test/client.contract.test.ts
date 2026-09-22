@@ -525,6 +525,38 @@ test("createSession posts octet-stream without the existing bearer", async () =>
   assert.equal(observed.authorization, null);
 });
 
+test("default fetch is bound so Chromium Window.fetch is not illegally invoked", async () => {
+  const previous = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = function windowFetch(this: unknown, input: RequestInfo | URL) {
+    if (this !== globalThis) {
+      throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+    }
+    calls += 1;
+    assert.match(String(input), new RegExp(`/v1/sellers/${SELLER_PUBKY}/listings`));
+    return Promise.resolve(
+      new Response(JSON.stringify({ listings: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  } as typeof fetch;
+  try {
+    const client = new PubkyShopClient({
+      session: "opaque-host-bearer",
+      serviceUrl: "https://inventory.example/",
+    });
+    const result = await client.listings(SELLER_PUBKY);
+    assert.equal(result.ok, true);
+    assert.equal(calls, 1);
+    if (result.ok) {
+      assert.deepEqual(result.value.listings, []);
+    }
+  } finally {
+    globalThis.fetch = previous;
+  }
+});
+
 test("events since alias is sent as the service cursor query", async () => {
   let url = "";
   const client = new PubkyShopClient({
