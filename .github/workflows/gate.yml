@@ -12,7 +12,7 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 4 # ~2× CI median (job 81s / gate 72s on PR #14) + setup slack
     steps:
       - name: Check out
         uses: actions/checkout@v4
