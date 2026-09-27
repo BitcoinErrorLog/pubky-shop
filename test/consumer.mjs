@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 const sdk = await import("../dist/index.js");
 const node = await import("../dist/node.js");
+const shopify = await import("../dist/connectors/shopify/index.js");
 
 assert.equal(typeof sdk.PubkyShopClient, "function");
 assert.equal(typeof sdk.exportCanonicalCsv, "function");
@@ -18,3 +19,8 @@ assert.equal(sdk.FileManifestStore, undefined);
 assert.equal(typeof node.FileManifestStore, "function");
 assert.equal(typeof node.planImportStream, "function");
 assert.equal(typeof node.planImport, "function");
+assert.equal(typeof shopify.mapShopifyProductCsv, "function");
+assert.equal(typeof shopify.shopifyAdminHttp, "function");
+assert.equal(typeof shopify.applyShopifyWebhook, "function");
+assert.equal(sdk.mapShopifyProductCsv, undefined);
+assert.equal(shopify.LIVE_SHOPIFY_BOUNDARY.liveStoreCalls, false);

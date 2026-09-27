@@ -19,12 +19,14 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "connectors/shopify-bridge/BOUNDARY.md"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "pubky-shop": "dist/cli/bin.js"
+    "pubky-shop": "dist/cli/bin.js",
+    "shopify-bridge": "dist/connectors/shopify/bin.js"
   },
   "exports": {
     ".": {
@@ -34,6 +36,10 @@
     "./node": {
       "types": "./dist/node.d.ts",
       "import": "./dist/node.js"
+    },
+    "./connectors/shopify": {
+      "types": "./dist/connectors/shopify/index.d.ts",
+      "import": "./dist/connectors/shopify/index.js"
     }
   },
   "scripts": {

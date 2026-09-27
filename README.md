@@ -325,6 +325,26 @@ pubky-shop auth logout --force-local
 `--json` prints `{ok,data,error{code,message}}`. Exit `0` success, `1` usage,
 `2` auth/denied, `3` remote/rate-limit/unavailable.
 
+## Shopify bridge
+
+`@bitcoinerrorlog/pubky-shop/connectors/shopify` maps the published Shopify
+product CSV and the `products/update` / `inventory_levels/update` webhook
+bodies onto canonical CSV rows, then drives the existing client:
+homeserver PUT, `syncMany`, `inventory.adjust` with `external_ref.channel`
+`shopify`, seller `events`, and Pubky webhook verification. The Admin API
+client speaks GraphQL `inventorySetQuantities`. Tests run it against recorded
+responses. The live store, token, and webhook endpoint are documented in
+`connectors/shopify-bridge/BOUNDARY.md`.
+
+```sh
+shopify-bridge map-csv --input products.csv --seller <pubky> --currency USD --exponent 2 --output canonical.csv --losses losses.json
+shopify-bridge config-summary --secrets bridge-secrets.json
+```
+
+The secret file holds the Admin token and the Pubky session. `config-summary`
+prints the shop domain and seller pubky only. The `.` export does not import
+this Node-only entry.
+
 ## Development gates
 
 Runtime dependencies (`@noble/curves`, `qrcode`) belong to the CLI.
