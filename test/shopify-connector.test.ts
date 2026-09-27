@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -212,13 +212,23 @@ test("Shopify HMAC and clock skew fail closed", () => {
   const flipped = Buffer.from(signShopify(raw), "base64");
   flipped[0] = (flipped[0] ?? 0) ^ 0x01;
   assert.equal(verifyShopifyHmac(raw, flipped.toString("base64"), WEBHOOK_SECRET), false);
-  assert.equal(
-    timingSafeEqual(
-      createHash("sha256").update("x").digest(),
-      createHash("sha256").update("x").digest(),
-    ),
-    true,
+});
+
+test("result rendering redacts a secret planted in the payload", () => {
+  const rendered = renderBridgeResult(
+    {
+      outcome: "rejected",
+      reason: "failed",
+      losses: [{ code: "html_body", source: "body", detail: `${TOKEN} ${SESSION}` }],
+      listingId: "",
+      adjustDelta: "",
+      idempotencyKey: "",
+    },
+    secrets(),
   );
+  assert.equal(rendered.includes(TOKEN), false);
+  assert.equal(rendered.includes(SESSION), false);
+  assert.equal(rendered.includes("[redacted]"), true);
 });
 
 test("Admin HTTP client sends the token only to the shop origin", async () => {
