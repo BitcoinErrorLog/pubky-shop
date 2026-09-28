@@ -2,6 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { argv, exit, stdin, stdout } from "node:process";
 import { homeserverSessionStoreFor, loadStoredHomeserverSession } from "../../cli/credentials.js";
+import { canonicalPubky } from "../../cli/proof.js";
 import { PubkyShopClient } from "../../client.js";
 import { exportCanonicalCsv } from "../../csv.js";
 import { PubkyShopError } from "../../errors.js";
@@ -94,7 +95,7 @@ async function webhook(): Promise<number> {
   const secretsFile = flag("--secrets");
   const receiptsDir = flag("--receipts");
   const fixturesPath = flag("--admin-fixtures");
-  if (flag("--put-dir") !== undefined) {
+  if (argv.includes("--put-dir")) {
     writeOut("put-dir is not a homeserver\n", []);
     return 2;
   }
@@ -110,6 +111,10 @@ async function webhook(): Promise<number> {
   );
   if (stored === undefined) {
     writeOut("homeserver_session_missing\n", secretValues(secrets));
+    return 1;
+  }
+  if (canonicalPubky(stored.pubky) !== canonicalPubky(secrets.sellerPubky)) {
+    writeOut("homeserver_seller_mismatch\n", secretValues(secrets));
     return 1;
   }
   const homeserver = await writerFromStoredHomeserverSession(stored);

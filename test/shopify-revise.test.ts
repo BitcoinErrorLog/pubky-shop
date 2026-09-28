@@ -516,7 +516,7 @@ test("homeserver writer puts bytes on the session and the command does not use a
     },
     async delete() {},
   };
-  assert.equal(LIVE_SHOPIFY_BOUNDARY.homeserverMediaPutOnCliSession, true);
+  assert.equal(LIVE_SHOPIFY_BOUNDARY.homeserverMediaPutOnCliSession, false);
   const writer = writerFromHomeserverSession(session);
   await writer.putBytes(
     "/pub/pubky.app/marketplace/v1/listings/night-boots/media/m1",
@@ -585,6 +585,47 @@ test("homeserver writer puts bytes on the session and the command does not use a
   );
   assert.equal(refused.status, 2);
   assert.equal(refused.stdout.includes("put-dir is not a homeserver"), true);
+  const bare = spawnSync(
+    process.execPath,
+    [
+      bin,
+      "webhook",
+      "--secrets",
+      path.join(directory, "secrets.json"),
+      "--receipts",
+      path.join(directory, "receipts"),
+      "--put-dir",
+    ],
+    { encoding: "utf8", input: "" },
+  );
+  assert.equal(bare.status, 2);
+  assert.equal(bare.stdout.includes("put-dir is not a homeserver"), true);
+  const otherPubky = "z".repeat(52);
+  const otherCreds = path.join(directory, "other-creds");
+  await filesystemHomeserverSessionStore(otherCreds).put("https://inventory.example", {
+    pubky: otherPubky,
+    secret: "not-a-real-session-secret",
+    capabilities: ["/:rw"],
+  });
+  const mismatch = spawnSync(
+    process.execPath,
+    [
+      bin,
+      "webhook",
+      "--secrets",
+      path.join(directory, "secrets.json"),
+      "--receipts",
+      path.join(directory, "receipts"),
+    ],
+    {
+      encoding: "utf8",
+      input: "",
+      env: { ...process.env, PUBKY_SHOP_CREDENTIAL_DIR: otherCreds, PUBKY_SHOP_PUBKY: otherPubky },
+    },
+  );
+  assert.equal(mismatch.status, 1);
+  assert.equal(mismatch.stdout.includes("homeserver_seller_mismatch"), true);
+  assert.equal(mismatch.stdout.includes("not-a-real-session-secret"), false);
 });
 
 function levels(quantity: number): Response {

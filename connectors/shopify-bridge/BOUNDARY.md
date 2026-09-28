@@ -10,9 +10,12 @@ configured `*.myshopify.com` Admin GraphQL origin, and the Pubky session is
 attached only to the configured marketplace-service origin.
 
 The bridge does not read a seller recovery file. `shopify-bridge webhook`
-loads the CLI's stored homeserver session and writes listing text with
-`storage.putText` and media bytes with `storage.putBytes`. `--put-dir` is
-refused. A local directory is not a homeserver writer on this command.
+loads the CLI's stored homeserver session only when that session's pubky is
+the seller pubky in the secret file, then writes listing text with
+`storage.putText` and media bytes with `storage.putBytes`. A homeserver
+accepting those bytes is not part of this fixture gate.
+`--put-dir` is refused, including when it is the last argument. A local
+directory is not a homeserver writer on this command.
 
 Stock is listing-total. Variant quantities at the single configured location
 are summed into that total. Quantities at every other location are a loss and
@@ -40,8 +43,10 @@ when that stock is already the planned quantity. A crash after the plan is
 stored replays that plan, including the same `inventory.adjust` idempotency
 key. A `revision_conflict` or `idempotency_conflict` is quarantined. The
 bridge does not read stock again and invent a new delta. A `sync-many` item
-404 or 409 is quarantined before adjust or checkpoint. A 408, 429, or 500
-item result is rejected and the same receipt retries.
+404 or 409 is quarantined before adjust or checkpoint. The homeserver record
+written before that sync is left in place: the receipt is not checkpointed
+and the catalog fingerprint is not remembered. A 408, 429, or 500 item
+result is rejected and the same receipt retries.
 
 Catalog PUT writes homeserver record revision 1 on the first import. A later
 delivery with the same catalog fingerprint does not PUT again. A later
