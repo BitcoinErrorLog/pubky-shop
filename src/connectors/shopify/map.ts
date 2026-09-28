@@ -669,8 +669,14 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
   return { products, skipped, headerLosses: headerLosses(headers) };
 }
 
-export function canonicalRowsFor(product: MappedProduct, media: JsonValue = []): CanonicalCsvRow[] {
-  const kept = product.variants.filter((variant) => variant.quantity > 0);
+export function canonicalRowsFor(
+  product: MappedProduct,
+  media: JsonValue = [],
+  options?: { readonly includeZeroQuantity?: boolean },
+): CanonicalCsvRow[] {
+  const kept = options?.includeZeroQuantity
+    ? product.variants
+    : product.variants.filter((variant) => variant.quantity > 0);
   const externalRefs: JsonObject = {
     channel: "shopify",
     external_id: product.externalId,

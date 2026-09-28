@@ -154,6 +154,12 @@ test("current Shopify CSV headers map and do not publish unscoped quantity", asy
     [0, 0],
   );
   assert.equal(canonicalRowsFor(product).length, 0);
+  const unscoped = canonicalRowsFor(product, [], { includeZeroQuantity: true });
+  assert.equal(unscoped.length, 2);
+  assert.deepEqual(
+    unscoped.map((row) => row.variantQuantity),
+    [0, 0],
+  );
   for (const code of [
     "csv_quantity_unscoped",
     "market_price_list",

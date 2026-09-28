@@ -40,9 +40,14 @@
     "./connectors/shopify": {
       "types": "./dist/connectors/shopify/index.d.ts",
       "import": "./dist/connectors/shopify/index.js"
+    },
+    "./connectors/shopify/map": {
+      "types": "./dist/connectors/shopify/map.d.ts",
+      "import": "./dist/connectors/shopify/map.js"
     }
   },
   "scripts": {
+    "prepare": "tsc -p tsconfig.build.json",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "biome lint .",
