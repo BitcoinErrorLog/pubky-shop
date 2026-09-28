@@ -1,8 +1,8 @@
 import type { CanonicalCsvRow } from "../../csv.js";
 import type { JsonObject, JsonValue, LosslessJsonValue } from "../../json.js";
-import { parseBoundedJsonLossless } from "../../json.js";
+import { canonicalJson, parseBoundedJsonLossless } from "../../json.js";
 import { ShopifyBridgeError } from "./errors.js";
-import { isPubkyId, shopifyGid } from "./ids.js";
+import { isPubkyId, payloadHash, shopifyGid } from "./ids.js";
 
 export const SHOPIFY_LOSS_CODES = [
   "html_body",
@@ -35,6 +35,8 @@ export const SHOPIFY_LOSS_CODES = [
   "handle_not_identity",
   "location_stock_unresolved",
   "sku_not_searchable",
+  "metafield",
+  "collection",
 ] as const;
 
 export type ShopifyLossCode = (typeof SHOPIFY_LOSS_CODES)[number];
@@ -101,73 +103,114 @@ export interface ShopifyCsvMap {
 }
 
 /**
- * Published Shopify product CSV headers that map without a manual column table.
- * Market price columns are recognized by prefix and recorded as losses.
+ * Current published product CSV columns and the legacy names they replaced.
+ * Both spellings normalize to one internal field. See Shopify's product CSV table.
  */
 export const SHOPIFY_PRODUCT_CSV_HEADERS = [
-  "Handle",
   "Title",
+  "URL handle",
+  "Handle",
+  "Description",
   "Body (HTML)",
   "Vendor",
+  "Product category",
   "Product Category",
   "Type",
   "Tags",
+  "Published on online store",
   "Published",
-  "Option1 Name",
-  "Option1 Value",
-  "Option2 Name",
-  "Option2 Value",
-  "Option3 Name",
-  "Option3 Value",
-  "Variant SKU",
-  "Variant Grams",
-  "Variant Inventory Tracker",
-  "Variant Inventory Qty",
-  "Variant Inventory Policy",
-  "Variant Fulfillment Service",
-  "Variant Price",
-  "Variant Compare At Price",
-  "Variant Requires Shipping",
-  "Variant Taxable",
-  "Variant Barcode",
-  "Image Src",
-  "Image Position",
-  "Image Alt Text",
-  "Gift Card",
-  "SEO Title",
-  "SEO Description",
-  "Google Shopping / Google Product Category",
-  "Google Shopping / Gender",
-  "Google Shopping / Age Group",
-  "Google Shopping / MPN",
-  "Google Shopping / Condition",
-  "Google Shopping / Custom Product",
-  "Google Shopping / Custom Label 0",
-  "Google Shopping / Custom Label 1",
-  "Google Shopping / Custom Label 2",
-  "Google Shopping / Custom Label 3",
-  "Google Shopping / Custom Label 4",
-  "Variant Image",
-  "Variant Weight Unit",
-  "Variant Tax Code",
-  "Cost per item",
   "Status",
+  "SKU",
+  "Variant SKU",
+  "Option1 name",
+  "Option1 Name",
+  "Option1 value",
+  "Option1 Value",
+  "Price",
+  "Variant Price",
+  "Inventory quantity",
+  "Variant Inventory Qty",
+  "Product image URL",
+  "Image Src",
+  "Image alt text",
+  "Image Alt Text",
+  "Gift card",
+  "Gift Card",
 ] as const;
 
+const HEADER_FIELDS: Readonly<Record<string, string>> = {
+  Title: "title",
+  "URL handle": "handle",
+  Handle: "handle",
+  Description: "description",
+  "Body (HTML)": "description",
+  Vendor: "vendor",
+  "Product category": "product_category",
+  "Product Category": "product_category",
+  Type: "type",
+  Tags: "tags",
+  "Published on online store": "published",
+  Published: "published",
+  Status: "status",
+  SKU: "sku",
+  "Variant SKU": "sku",
+  "Option1 name": "option1_name",
+  "Option1 Name": "option1_name",
+  "Option1 value": "option1_value",
+  "Option1 Value": "option1_value",
+  "Option2 name": "option2_name",
+  "Option2 Name": "option2_name",
+  "Option2 value": "option2_value",
+  "Option2 Value": "option2_value",
+  "Option3 name": "option3_name",
+  "Option3 Name": "option3_name",
+  "Option3 value": "option3_value",
+  "Option3 Value": "option3_value",
+  Price: "price",
+  "Variant Price": "price",
+  "Inventory quantity": "inventory_quantity",
+  "Variant Inventory Qty": "inventory_quantity",
+  "Product image URL": "image_src",
+  "Image Src": "image_src",
+  "Image position": "image_position",
+  "Image Position": "image_position",
+  "Image alt text": "image_alt",
+  "Image Alt Text": "image_alt",
+  "Variant image URL": "variant_image",
+  "Variant Image": "variant_image",
+  "Gift card": "gift_card",
+  "Gift Card": "gift_card",
+  "Google Shopping / Condition": "condition",
+};
+
 const HEADER_LOSSES: Readonly<Record<string, ShopifyLossCode>> = {
+  "Compare-at price": "compare_at_price",
   "Variant Compare At Price": "compare_at_price",
   "Cost per item": "cost",
+  Barcode: "barcode",
   "Variant Barcode": "barcode",
+  "SEO title": "seo",
   "SEO Title": "seo",
+  "SEO description": "seo",
   "SEO Description": "seo",
+  "Weight value (grams)": "weight",
   "Variant Grams": "weight",
+  "Weight unit for display": "weight",
   "Variant Weight Unit": "weight",
+  "Inventory tracker": "inventory_policy",
   "Variant Inventory Tracker": "inventory_policy",
+  "Continue selling when out of stock": "inventory_policy",
   "Variant Inventory Policy": "inventory_policy",
+  "Fulfillment service": "inventory_policy",
   "Variant Fulfillment Service": "inventory_policy",
+  "Charge tax": "tax",
   "Variant Taxable": "tax",
   "Variant Tax Code": "tax",
+  "Requires shipping": "shipping_price_absent",
+  "Variant Requires Shipping": "shipping_price_absent",
+  "Inventory quantity": "csv_quantity_unscoped",
   "Variant Inventory Qty": "csv_quantity_unscoped",
+  Collection: "collection",
 };
 
 function loss(code: ShopifyLossCode, source: string, detail: string): ShopifyLoss {
@@ -274,36 +317,60 @@ function parseRfc4180(textBody: string): string[][] {
   return rows.filter((entry) => entry.some((value) => value !== ""));
 }
 
+function headerRole(
+  header: string,
+): "field" | "loss" | "image" | "market" | "google" | "metafield" | "unknown" {
+  if (
+    header.startsWith("Price / ") ||
+    header.startsWith("Compare-at price / ") ||
+    header.startsWith("Compare At Price / ") ||
+    header.startsWith("Included / ")
+  ) {
+    return "market";
+  }
+  if (header.includes("product.metafields.") || /^Option\d+ LinkedTo$/i.test(header)) {
+    return "metafield";
+  }
+  if (header.startsWith("Google Shopping /") && header !== "Google Shopping / Condition") {
+    return "google";
+  }
+  if (HEADER_FIELDS[header] !== undefined) {
+    return header === "Product image URL" ||
+      header === "Image Src" ||
+      header === "Variant image URL" ||
+      header === "Variant Image" ||
+      header === "Image position" ||
+      header === "Image Position" ||
+      header === "Image alt text" ||
+      header === "Image Alt Text"
+      ? "image"
+      : "field";
+  }
+  if (HEADER_LOSSES[header] !== undefined) {
+    return "loss";
+  }
+  return "unknown";
+}
+
 function headerLosses(headers: readonly string[]): ShopifyLoss[] {
   const losses: ShopifyLoss[] = [];
   for (const header of headers) {
-    if (
-      header.startsWith("Price / ") ||
-      header.startsWith("Compare At Price / ") ||
-      header.startsWith("Included / ")
-    ) {
+    const role = headerRole(header);
+    if (role === "market") {
       losses.push(
         loss("market_price_list", header, "Market and price-list columns are not imported."),
       );
       continue;
     }
-    if (header.startsWith("Google Shopping /")) {
+    if (role === "metafield") {
+      losses.push(loss("metafield", header, "Metafield columns have no Pubky field."));
+      continue;
+    }
+    if (role === "google") {
       losses.push(loss("google_shopping", header, "Google Shopping columns have no Pubky field."));
       continue;
     }
-    const code = HEADER_LOSSES[header];
-    if (code !== undefined) {
-      losses.push(
-        loss(code, header, "The Shopify column has no Pubky field and is not copied into stock."),
-      );
-      continue;
-    }
-    if (
-      header === "Image Src" ||
-      header === "Image Position" ||
-      header === "Image Alt Text" ||
-      header === "Variant Image"
-    ) {
+    if (role === "image") {
       losses.push(
         loss(
           "image_src_requires_seller_download",
@@ -313,7 +380,14 @@ function headerLosses(headers: readonly string[]): ShopifyLoss[] {
       );
       continue;
     }
-    if (!(SHOPIFY_PRODUCT_CSV_HEADERS as readonly string[]).includes(header)) {
+    const code = HEADER_LOSSES[header];
+    if (code !== undefined) {
+      losses.push(
+        loss(code, header, "The Shopify column has no Pubky field and is not copied into stock."),
+      );
+      continue;
+    }
+    if (role === "unknown") {
       losses.push(
         loss(
           "unmapped_header",
@@ -341,22 +415,44 @@ function recordsFromCsv(bytes: Uint8Array): { headers: string[]; records: CsvRec
   if (headers.some((header) => header === "") || new Set(headers).size !== headers.length) {
     throw new ShopifyBridgeError("invalid_shopify_csv_header");
   }
-  if (
-    !headers.includes("Handle") ||
-    !headers.includes("Title") ||
-    !headers.includes("Variant Price")
-  ) {
+  const fields = new Set(
+    headers.map((header) => HEADER_FIELDS[header]).filter((field) => field !== undefined),
+  );
+  if (!fields.has("handle") || !fields.has("title") || !fields.has("price")) {
     throw new ShopifyBridgeError("invalid_shopify_csv_header");
   }
   const records: CsvRecord[] = [];
   for (const cells of table.slice(1)) {
     const values: Record<string, string> = Object.create(null) as Record<string, string>;
     headers.forEach((header, index) => {
-      values[header] = cells[index] ?? "";
+      const field = HEADER_FIELDS[header];
+      if (field === undefined) {
+        return;
+      }
+      const cell = cells[index] ?? "";
+      const current = values[field];
+      if (current !== undefined && current !== "" && cell !== "" && current !== cell) {
+        throw new ShopifyBridgeError("invalid_shopify_csv_header");
+      }
+      if (current === undefined || current === "") {
+        values[field] = cell;
+      }
     });
     records.push({ values });
   }
   return { headers, records };
+}
+
+export function csvProductSourceHash(bytes: Uint8Array, handle: string): string {
+  const { records } = recordsFromCsv(bytes);
+  const rows = records
+    .filter((record) => (record.values.handle ?? "").trim() === handle)
+    .map((record) => {
+      const copy: Record<string, string> = { ...record.values };
+      delete copy.inventory_quantity;
+      return copy;
+    });
+  return payloadHash(new TextEncoder().encode(canonicalJson(rows)));
 }
 
 function truthy(value: string | undefined): boolean {
@@ -364,11 +460,11 @@ function truthy(value: string | undefined): boolean {
 }
 
 function publishedActive(values: Readonly<Record<string, string>>): boolean {
-  const status = (values.Status ?? "").trim().toLowerCase();
+  const status = (values.status ?? "").trim().toLowerCase();
   if (status === "draft" || status === "archived") {
     return false;
   }
-  const published = (values.Published ?? "").trim();
+  const published = (values.published ?? "").trim();
   if (published !== "" && !truthy(published)) {
     return false;
   }
@@ -376,7 +472,7 @@ function publishedActive(values: Readonly<Record<string, string>>): boolean {
 }
 
 function conditionFrom(values: Readonly<Record<string, string>>, losses: ShopifyLoss[]): string {
-  const raw = (values["Google Shopping / Condition"] ?? "").trim().toLowerCase();
+  const raw = (values.condition ?? "").trim().toLowerCase();
   if (raw === "new" || raw === "used" || raw === "refurbished") {
     return raw === "refurbished" ? "used" : raw;
   }
@@ -396,8 +492,8 @@ function tagsFrom(value: string): string[] {
 function optionsFrom(values: Readonly<Record<string, string>>): JsonObject {
   const options: JsonObject = {};
   for (const index of [1, 2, 3] as const) {
-    const name = (values[`Option${index} Name`] ?? "").trim();
-    const optionValue = (values[`Option${index} Value`] ?? "").trim();
+    const name = (values[`option${index}_name`] ?? "").trim();
+    const optionValue = (values[`option${index}_value`] ?? "").trim();
     if (name !== "" && optionValue !== "") {
       options[name] = optionValue;
     }
@@ -406,9 +502,7 @@ function optionsFrom(values: Readonly<Record<string, string>>): JsonObject {
 }
 
 function isVariantRow(values: Readonly<Record<string, string>>): boolean {
-  return (
-    (values["Variant Price"] ?? "").trim() !== "" || (values["Variant SKU"] ?? "").trim() !== ""
-  );
+  return (values.price ?? "").trim() !== "" || (values.sku ?? "").trim() !== "";
 }
 
 export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig): ShopifyCsvMap {
@@ -418,7 +512,7 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
   const { headers, records } = recordsFromCsv(bytes);
   const grouped = new Map<string, CsvRecord[]>();
   for (const record of records) {
-    const handle = (record.values.Handle ?? "").trim();
+    const handle = (record.values.handle ?? "").trim();
     if (handle === "") {
       continue;
     }
@@ -441,7 +535,7 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
       });
       continue;
     }
-    if (rows.some((row) => truthy(row.values["Gift Card"] ?? ""))) {
+    if (rows.some((row) => truthy(row.values.gift_card ?? ""))) {
       skipped.push({
         handle,
         losses: [loss("gift_card", "Gift Card", "Gift cards are not imported.")],
@@ -458,21 +552,21 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
       continue;
     }
     const title =
-      rows.map((row) => (row.values.Title ?? "").trim()).find((value) => value !== "") ?? "";
+      rows.map((row) => (row.values.title ?? "").trim()).find((value) => value !== "") ?? "";
     const html =
-      rows.map((row) => row.values["Body (HTML)"] ?? "").find((value) => value.trim() !== "") ?? "";
-    if (html.trim() !== "") {
-      losses.push(loss("html_body", "Body (HTML)", "HTML was stripped to text and is not stored."));
+      rows.map((row) => row.values.description ?? "").find((value) => value.trim() !== "") ?? "";
+    if (html.trim() !== "" && /<[^>]+>/.test(html)) {
+      losses.push(loss("html_body", "Description", "HTML was stripped to text and is not stored."));
     }
     const description = stripHtml(html);
     const category =
-      (first.values["Product Category"] ?? "").trim() || (first.values.Type ?? "").trim();
+      (first.values.product_category ?? "").trim() || (first.values.type ?? "").trim();
     if (category === "") {
-      losses.push(loss("category_absent", "Product Category", "No category was present."));
+      losses.push(loss("category_absent", "Product category", "No category was present."));
     }
-    const vendor = (first.values.Vendor ?? "").trim();
-    const productType = (first.values.Type ?? "").trim();
-    const productCategory = (first.values["Product Category"] ?? "").trim();
+    const vendor = (first.values.vendor ?? "").trim();
+    const productType = (first.values.type ?? "").trim();
+    const productCategory = (first.values.product_category ?? "").trim();
     const taxonomy: JsonObject = {};
     if (vendor !== "") {
       taxonomy.vendor = vendor;
@@ -483,7 +577,7 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
     if (productCategory !== "") {
       taxonomy.productCategory = productCategory;
     }
-    const tags = tagsFrom(first.values.Tags ?? "");
+    const tags = tagsFrom(first.values.tags ?? "");
     const condition = conditionFrom(first.values, losses);
     losses.push(
       loss(
@@ -495,9 +589,9 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
     losses.push(loss("return_policy_absent", "return_policy", "Shopify CSV has no return policy."));
     const images: MappedImage[] = [];
     for (const row of rows) {
-      const src = (row.values["Image Src"] ?? "").trim();
+      const src = (row.values.image_src ?? "").trim() || (row.values.variant_image ?? "").trim();
       if (src !== "") {
-        images.push({ src, alt: (row.values["Image Alt Text"] ?? "").trim() });
+        images.push({ src, alt: (row.values.image_alt ?? "").trim() });
       }
     }
     const variants: MappedVariant[] = [];
@@ -506,24 +600,23 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
       if (!isVariantRow(row.values)) {
         return;
       }
-      const price = minorUnits((row.values["Variant Price"] ?? "").trim(), config.exponent);
+      const price = minorUnits((row.values.price ?? "").trim(), config.exponent);
       if (price === undefined) {
         losses.push(
-          loss("price_scale", "Variant Price", "The price does not fit the configured exponent."),
+          loss("price_scale", "Price", "The price does not fit the configured exponent."),
         );
         return;
       }
       prices.push(price);
-      const sku = (row.values["Variant SKU"] ?? "").trim();
+      const sku = (row.values.sku ?? "").trim();
       const variantId = isPubkyId(sku) ? sku : `v${index + 1}`;
-      const quantityText = (row.values["Variant Inventory Qty"] ?? "").trim();
-      const quantity = /^(?:0|[1-9]\d*)$/.test(quantityText) ? Number(quantityText) : 0;
+      const quantityText = (row.values.inventory_quantity ?? "").trim();
       if (quantityText !== "") {
         losses.push(
           loss(
             "csv_quantity_unscoped",
-            "Variant Inventory Qty",
-            "CSV quantity is not a single location.",
+            "Inventory quantity",
+            "CSV quantity is not a selected location and is not canonical stock.",
           ),
         );
       }
@@ -531,7 +624,7 @@ export function mapShopifyProductCsv(bytes: Uint8Array, config: ShopifyMapConfig
         variantId,
         sku,
         inventoryItemId: "",
-        quantity,
+        quantity: 0,
         options: optionsFrom(row.values),
       });
     });

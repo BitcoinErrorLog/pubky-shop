@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from "node:fs/promises";
 import { argv, exit, stdin, stdout } from "node:process";
-
+import { homeserverSessionStoreFor, loadStoredHomeserverSession } from "../../cli/credentials.js";
 import { PubkyShopClient } from "../../client.js";
 import { exportCanonicalCsv } from "../../csv.js";
 import { PubkyShopError } from "../../errors.js";
 import { type RecordedShopifyFixtures, recordedShopifyAdmin, shopifyAdminHttp } from "./admin.js";
-import { applyShopifyWebhook, directoryHomeserverWriter, renderBridgeResult } from "./effects.js";
+import { applyShopifyWebhook, renderBridgeResult } from "./effects.js";
 import { ShopifyBridgeError } from "./errors.js";
 import { canonicalRowsFor, mapShopifyProductCsv } from "./map.js";
 import { FileCatalog, FileReceiptLog } from "./receipts.js";
 import { redact } from "./redact.js";
 import { loadBridgeSecrets, secretValues } from "./secrets.js";
+import { writerFromStoredHomeserverSession } from "./session-writer.js";
 
 function flag(name: string): string | undefined {
   const index = argv.indexOf(name);
@@ -92,13 +93,26 @@ async function configSummary(): Promise<number> {
 async function webhook(): Promise<number> {
   const secretsFile = flag("--secrets");
   const receiptsDir = flag("--receipts");
-  const putDir = flag("--put-dir");
   const fixturesPath = flag("--admin-fixtures");
-  if (secretsFile === undefined || receiptsDir === undefined || putDir === undefined) {
-    writeOut("webhook requires --secrets --receipts --put-dir\n", []);
+  if (flag("--put-dir") !== undefined) {
+    writeOut("put-dir is not a homeserver\n", []);
+    return 2;
+  }
+  if (secretsFile === undefined || receiptsDir === undefined) {
+    writeOut("webhook requires --secrets --receipts\n", []);
     return 2;
   }
   const secrets = await loadBridgeSecrets(secretsFile);
+  const stored = await loadStoredHomeserverSession(
+    homeserverSessionStoreFor(process.env, process.cwd()),
+    secrets.serviceUrl,
+    process.env,
+  );
+  if (stored === undefined) {
+    writeOut("homeserver_session_missing\n", secretValues(secrets));
+    return 1;
+  }
+  const homeserver = await writerFromStoredHomeserverSession(stored);
   const chunks: Buffer[] = [];
   for await (const chunk of stdin) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -109,6 +123,7 @@ async function webhook(): Promise<number> {
     topic: flag("--topic") ?? "",
     shopDomain: flag("--shop-domain") ?? "",
     webhookId: flag("--webhook-id") ?? "",
+    eventId: flag("--event-id") ?? "",
     triggeredAt: flag("--triggered-at") ?? "",
   };
   const admin =
@@ -121,7 +136,7 @@ async function webhook(): Promise<number> {
     secrets,
     admin,
     pubky: new PubkyShopClient({ session: secrets.pubkySession, serviceUrl: secrets.serviceUrl }),
-    homeserver: await directoryHomeserverWriter(putDir),
+    homeserver,
     receipts: new FileReceiptLog(receiptsDir),
     catalog: new FileCatalog(receiptsDir),
     nowMs: Date.now(),

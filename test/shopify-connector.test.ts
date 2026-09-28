@@ -17,7 +17,6 @@ import {
   assertPrivateMode,
   type BridgeSecrets,
   catalogRecordText,
-  directoryHomeserverWriter,
   FileCatalog,
   FileReceiptLog,
   type HomeserverWriter,
@@ -88,6 +87,7 @@ function headers(
     topic,
     shopDomain: "fixture-shop.myshopify.com",
     webhookId,
+    eventId: "",
     triggeredAt,
   };
 }
@@ -158,9 +158,39 @@ test("Shopify CSV maps onto canonical rows and records losses", async () => {
   assert.equal(product.description, "Lined boots");
   assert.deepEqual(
     product.variants.map((variant) => variant.quantity),
-    [12, 7],
+    [0, 0],
   );
-  const rows = (await import("../src/connectors/shopify/map.js")).canonicalRowsFor(product);
+  assert.equal(
+    (await import("../src/connectors/shopify/map.js")).canonicalRowsFor(product).length,
+    0,
+  );
+  const located = (await import("../src/connectors/shopify/map.js")).applyLocationQuantities(
+    {
+      ...product,
+      variants: product.variants.map((variant, index) => ({
+        ...variant,
+        inventoryItemId: `gid://shopify/InventoryItem/${index + 1}`,
+      })),
+    },
+    [
+      {
+        inventoryItemId: "gid://shopify/InventoryItem/1",
+        locationId: shopifyGid("Location", "1"),
+        available: 4,
+      },
+      {
+        inventoryItemId: "gid://shopify/InventoryItem/2",
+        locationId: shopifyGid("Location", "1"),
+        available: 1,
+      },
+    ],
+    "1",
+  );
+  const rows = (await import("../src/connectors/shopify/map.js")).canonicalRowsFor(located.product);
+  assert.deepEqual(
+    rows.map((row) => row.variantQuantity),
+    [4, 1],
+  );
   assert.equal(catalogRecordText(rows), listingRecordText(listingRecordFromRows(rows)));
   const parsed = parseCanonicalCsv(
     new Uint8Array(await import("../src/csv.js").then((csv) => csv.exportCanonicalCsv(rows))),
@@ -267,10 +297,14 @@ test("Admin HTTP client sends the token only to the shop origin", async () => {
     inventoryItemId: ITEM,
     locationId: shopifyGid("Location", LOCATION),
     quantity: 4,
+    compareQuantity: 4,
     referenceDocumentUri:
       "https://pubky.app/marketplace/events/00000000-0000-4000-8000-0000000000aa",
   });
   assert.equal(set.adjustmentGroupId, "gid://shopify/InventoryAdjustmentGroup/1");
+  const recorded = JSON.parse(captured) as { body: string };
+  assert.equal(recorded.body.includes('"ignoreCompareQuantity":false'), true);
+  assert.equal(recorded.body.includes('"compareQuantity":4'), true);
   assert.equal(captured.includes(SESSION), false);
   assert.throws(
     () => shopifyAdminHttp({ shopDomain: "evil.example", accessToken: TOKEN, fetch: fetchImpl }),
@@ -318,6 +352,7 @@ test("import and stock sync round trip against fixtures", async () => {
     external_ref: { channel: string; external_id: string };
   }[] = [];
   let projection: { available: number; revision: number } | undefined;
+  let shopifyAvailable = 4;
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
     const headers = new Headers(init?.headers);
@@ -351,7 +386,7 @@ test("import and stock sync round trip against fixtures", async () => {
                   : [
                       {
                         location: { id: shopifyGid("Location", LOCATION) },
-                        quantities: [{ name: "available", quantity: 4 }],
+                        quantities: [{ name: "available", quantity: shopifyAvailable }],
                       },
                       {
                         location: { id: OTHER_LOCATION },
@@ -399,7 +434,18 @@ test("import and stock sync round trip against fixtures", async () => {
     });
     if (url.includes("/v1/listings/sync-many")) {
       return json(
-        { schema_version: 1, kind: "listing.sync_many", results: [{ status: 207 }] },
+        {
+          schema_version: 1,
+          kind: "listing.sync_many",
+          results: [
+            {
+              seller_pubky: SELLER_PUBKY,
+              listing_id: "night-boots",
+              status: 207,
+              result: { ok: true },
+            },
+          ],
+        },
         207,
       );
     }
@@ -576,6 +622,8 @@ test("import and stock sync round trip against fixtures", async () => {
     true,
   );
 
+  shopifyAvailable = 8;
+  projection = { available: 5, revision: projection?.revision ?? 1 };
   const pulled = await pullInventoryEvents(ctx);
   assert.equal(pulled[0]?.outcome, "applied");
   assert.equal(
@@ -639,7 +687,18 @@ test("a crash between plan and checkpoint does not double-apply", async () => {
     }
     if (url.includes("/v1/listings/sync-many")) {
       return json(
-        { schema_version: 1, kind: "listing.sync_many", results: [{ status: 207 }] },
+        {
+          schema_version: 1,
+          kind: "listing.sync_many",
+          results: [
+            {
+              seller_pubky: SELLER_PUBKY,
+              listing_id: "night-boots",
+              status: 207,
+              result: { ok: true },
+            },
+          ],
+        },
         207,
       );
     }
@@ -890,8 +949,27 @@ test("Pubky webhook signature gates outbound stock", async () => {
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
     if (url.includes("myshopify.com")) {
+      const body = String(init?.body);
+      assert.equal(body.includes(secret), false);
+      if (body.includes("inventoryLevels")) {
+        return json({
+          data: {
+            inventoryItem: {
+              id: ITEM,
+              inventoryLevels: {
+                pageInfo: { hasNextPage: false },
+                nodes: [
+                  {
+                    location: { id: shopifyGid("Location", LOCATION) },
+                    quantities: [{ name: "available", quantity: 4 }],
+                  },
+                ],
+              },
+            },
+          },
+        });
+      }
       sets += 1;
-      assert.equal(String(init?.body).includes(secret), false);
       return json({
         data: {
           inventorySetQuantities: {
@@ -978,17 +1056,11 @@ test("config summary and csv command keep secrets off stdout", async () => {
     { encoding: "utf8" },
   );
   assert.equal(mapped.status, 0, mapped.stderr);
-  const parsed = parseCanonicalCsv(await readFile(output));
-  assert.equal(parsed.rows.length, 2);
+  assert.equal(await readFile(output, "utf8"), "");
   const lossText = await readFile(losses, "utf8");
   assert.equal(lossText.includes("html_body"), true);
-  const writer = await directoryHomeserverWriter(path.join(directory, "put"));
-  await writer.putText("/pub/pubky.app/marketplace/v1/listings/night-boots", '{"ok":true}\n');
-  const written = await readFile(
-    path.join(directory, "put/pub/pubky.app/marketplace/v1/listings/night-boots"),
-    "utf8",
-  );
-  assert.equal(written.includes("ok"), true);
+  assert.equal(lossText.includes("csv_quantity_unscoped"), true);
+  assert.equal(lossText.includes('"quantity":12'), false);
 });
 
 function json(body: unknown, status = 200): Response {

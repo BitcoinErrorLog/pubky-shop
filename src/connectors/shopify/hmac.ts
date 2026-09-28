@@ -2,17 +2,29 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function decodeStrictBase64(header: string): Buffer | undefined {
+  if (header.length < 4 || header.length > 512 || header.length % 4 !== 0) {
+    return undefined;
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(header)) {
+    return undefined;
+  }
+  const supplied = Buffer.from(header, "base64");
+  if (supplied.toString("base64") !== header) {
+    return undefined;
+  }
+  return supplied;
+}
+
 export function verifyShopifyHmac(raw: Uint8Array, header: string, secret: string): boolean {
-  if (header.length < 1 || header.length > 512 || secret.length < 1) {
+  if (secret.length < 1) {
+    return false;
+  }
+  const supplied = decodeStrictBase64(header);
+  if (supplied === undefined) {
     return false;
   }
   const expected = createHmac("sha256", secret).update(raw).digest();
-  let supplied: Buffer;
-  try {
-    supplied = Buffer.from(header, "base64");
-  } catch {
-    return false;
-  }
   if (supplied.length !== expected.length) {
     return false;
   }

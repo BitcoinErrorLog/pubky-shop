@@ -25,7 +25,7 @@ export const VARIANT_BY_SKU_QUERY = `query variantBySku($query: String!) {
 export const INVENTORY_SET_MUTATION = `mutation inventorySet($input: InventorySetQuantitiesInput!) {
   inventorySetQuantities(input: $input) {
     inventoryAdjustmentGroup { id }
-    userErrors { field message }
+    userErrors { field message code }
   }
 }`;
 
@@ -38,6 +38,7 @@ export interface InventorySetInput {
   readonly inventoryItemId: string;
   readonly locationId: string;
   readonly quantity: number;
+  readonly compareQuantity: number;
   readonly referenceDocumentUri: string;
 }
 
@@ -54,7 +55,7 @@ export interface RecordedShopifyFixtures {
 }
 
 function inventorySetKey(input: InventorySetInput): string {
-  return `${input.inventoryItemId}|${input.locationId}|${input.quantity}|${input.referenceDocumentUri}`;
+  return `${input.inventoryItemId}|${input.locationId}|${input.compareQuantity}|${input.quantity}|${input.referenceDocumentUri}`;
 }
 
 export function recordedShopifyAdmin(fixtures: RecordedShopifyFixtures): ShopifyAdmin {
@@ -231,12 +232,13 @@ export function shopifyAdminHttp(config: ShopifyAdminHttpConfig): ShopifyAdmin {
           name: "available",
           reason: "correction",
           referenceDocumentUri: input.referenceDocumentUri,
-          ignoreCompareQuantity: true,
+          ignoreCompareQuantity: false,
           quantities: [
             {
               inventoryItemId: shopifyGid("InventoryItem", input.inventoryItemId),
               locationId: shopifyGid("Location", input.locationId),
               quantity: input.quantity,
+              compareQuantity: input.compareQuantity,
             },
           ],
         },
@@ -244,10 +246,18 @@ export function shopifyAdminHttp(config: ShopifyAdminHttpConfig): ShopifyAdmin {
       const data = asRecord(await graphql(client, INVENTORY_SET_MUTATION, variables));
       const payload = asRecord(data?.inventorySetQuantities);
       const userErrors = payload?.userErrors;
-      if (!Array.isArray(userErrors) || userErrors.length > 0) {
-        throw new ShopifyBridgeError("shopify_user_error", {
-          count: Array.isArray(userErrors) ? userErrors.length : 0,
+      if (!Array.isArray(userErrors)) {
+        throw new ShopifyBridgeError("shopify_response");
+      }
+      if (userErrors.length > 0) {
+        const stale = userErrors.some((entry) => {
+          const code = asRecord(entry)?.code;
+          return code === "COMPARE_QUANTITY_STALE" || code === "INVALID_COMPARE_QUANTITY";
         });
+        if (stale) {
+          throw new ShopifyBridgeError("shopify_quantity_conflict");
+        }
+        throw new ShopifyBridgeError("shopify_user_error", { count: userErrors.length });
       }
       const group = asRecord(payload?.inventoryAdjustmentGroup);
       if (typeof group?.id !== "string") {

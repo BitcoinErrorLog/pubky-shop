@@ -8,6 +8,7 @@ import type { ShopifyLoss } from "./map.js";
 export type ReceiptState =
   | "received"
   | "effect-planned"
+  | "effect-sent"
   | "effect-complete"
   | "checkpointed"
   | "quarantined";
@@ -36,6 +37,7 @@ export type PlannedEffect =
       readonly kind: "catalog";
       readonly listingId: string;
       readonly aggregateId: string;
+      readonly fingerprint: string;
       readonly recordText: string;
       readonly media: readonly {
         readonly path: string;
@@ -59,6 +61,7 @@ export type PlannedEffect =
       readonly kind: "inventory-set";
       readonly inventoryItemId: string;
       readonly locationId: string;
+      readonly compareQuantity: number;
       readonly quantity: number;
       readonly referenceDocumentUri: string;
       readonly losses: readonly ShopifyLoss[];
@@ -186,10 +189,110 @@ export class FileReceiptLog {
     });
   }
 
-  async markComplete(receipt: Receipt): Promise<Receipt> {
+  async markSent(receipt: Receipt): Promise<Receipt> {
     return this.#exclusive(async () => {
       const current = await this.#read(receipt.shopId, receipt.externalEventId);
       if (current === undefined || current.state !== "effect-planned") {
+        throw new ShopifyBridgeError("receipt_conflict");
+      }
+      const next: Receipt = { ...current, state: "effect-sent", reason: "effect_sent" };
+      await this.#write(next);
+      return next;
+    });
+  }
+
+  async openShopifyDelivery(
+    shopId: string,
+    deliveryId: string,
+    eventId: string,
+    payloadHash: string,
+  ): Promise<Receipt> {
+    return this.#exclusive(async () => {
+      const deliveryAlias = await this.#readAlias(shopId, "delivery", deliveryId);
+      const eventAlias =
+        eventId === "" ? undefined : await this.#readAlias(shopId, "event", eventId);
+      if (deliveryAlias !== undefined && eventAlias !== undefined && deliveryAlias !== eventAlias) {
+        throw new ShopifyBridgeError("receipt_conflict");
+      }
+      const primary =
+        eventAlias ??
+        deliveryAlias ??
+        (eventId !== "" ? `event:${eventId}` : `delivery:${deliveryId}`);
+      let existing = await this.#read(shopId, primary);
+      if (existing === undefined) {
+        existing = {
+          channel: "shopify",
+          shopId,
+          externalEventId: primary,
+          payloadHash,
+          state: "received",
+          reason: "received",
+          conflictingHash: "",
+        };
+        await this.#write(existing);
+      } else if (existing.payloadHash !== payloadHash) {
+        if (!(existing.state === "quarantined" && existing.conflictingHash === payloadHash)) {
+          existing = {
+            ...existing,
+            state: "quarantined",
+            reason: "changed_payload",
+            conflictingHash: payloadHash,
+          };
+          await this.#write(existing);
+        }
+      }
+      await this.#writeAlias(shopId, "delivery", deliveryId, primary);
+      if (eventId !== "") {
+        await this.#writeAlias(shopId, "event", eventId, primary);
+      }
+      return existing;
+    });
+  }
+
+  async #readAlias(
+    shopId: string,
+    kind: "delivery" | "event",
+    id: string,
+  ): Promise<string | undefined> {
+    try {
+      const raw = await readFile(
+        path.join(this.#directory, `${this.#aliasName(shopId, kind, id)}.json`),
+        "utf8",
+      );
+      const parsed = JSON.parse(raw) as { primary?: string };
+      return typeof parsed.primary === "string" ? parsed.primary : undefined;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return undefined;
+      }
+      throw new ShopifyBridgeError("receipt_unreadable");
+    }
+  }
+
+  async #writeAlias(
+    shopId: string,
+    kind: "delivery" | "event",
+    id: string,
+    primary: string,
+  ): Promise<void> {
+    await mkdir(this.#directory, { recursive: true, mode: 0o700 });
+    await atomicWrite(
+      path.join(this.#directory, `${this.#aliasName(shopId, kind, id)}.json`),
+      `${JSON.stringify({ primary })}\n`,
+    );
+  }
+
+  #aliasName(shopId: string, kind: string, id: string): string {
+    return `alias-${fileName(shopId, `${kind}:${id}`)}`;
+  }
+
+  async markComplete(receipt: Receipt): Promise<Receipt> {
+    return this.#exclusive(async () => {
+      const current = await this.#read(receipt.shopId, receipt.externalEventId);
+      if (
+        current === undefined ||
+        (current.state !== "effect-planned" && current.state !== "effect-sent")
+      ) {
         throw new ShopifyBridgeError("receipt_conflict");
       }
       const next: Receipt = { ...current, state: "effect-complete", reason: "effect_complete" };
@@ -224,11 +327,15 @@ export class FileReceiptLog {
 
   async releaseQuarantine(shopId: string, externalEventId: string): Promise<void> {
     return this.#exclusive(async () => {
-      const current = await this.#read(shopId, externalEventId);
+      const aliased =
+        (await this.#readAlias(shopId, "event", externalEventId)) ??
+        (await this.#readAlias(shopId, "delivery", externalEventId));
+      const key = aliased ?? externalEventId;
+      const current = await this.#read(shopId, key);
       if (current === undefined || current.state !== "quarantined") {
         throw new ShopifyBridgeError("quarantine_missing");
       }
-      await unlink(path.join(this.#directory, `${fileName(shopId, externalEventId)}.json`));
+      await unlink(path.join(this.#directory, `${fileName(shopId, key)}.json`));
     });
   }
 }
@@ -236,6 +343,7 @@ export class FileReceiptLog {
 export class FileCatalog {
   readonly #file: string;
   #entries = new Map<string, CatalogEntry>();
+  #fingerprints = new Map<string, string>();
   #loaded = false;
 
   constructor(directory: string) {
@@ -247,9 +355,17 @@ export class FileCatalog {
       return;
     }
     try {
-      const parsed = JSON.parse(await readFile(this.#file, "utf8")) as { entries?: CatalogEntry[] };
+      const parsed = JSON.parse(await readFile(this.#file, "utf8")) as {
+        entries?: CatalogEntry[];
+        fingerprints?: Record<string, string>;
+      };
       for (const entry of parsed.entries ?? []) {
         this.#entries.set(entry.inventoryItemId, entry);
+      }
+      for (const [listingId, fingerprint] of Object.entries(parsed.fingerprints ?? {})) {
+        if (typeof fingerprint === "string") {
+          this.#fingerprints.set(listingId, fingerprint);
+        }
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -257,6 +373,17 @@ export class FileCatalog {
       }
     }
     this.#loaded = true;
+  }
+
+  async #save(): Promise<void> {
+    await mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
+    await atomicWrite(
+      this.#file,
+      `${JSON.stringify({
+        entries: [...this.#entries.values()],
+        fingerprints: Object.fromEntries(this.#fingerprints),
+      })}\n`,
+    );
   }
 
   async getByInventoryItem(inventoryItemId: string): Promise<CatalogEntry | undefined> {
@@ -267,6 +394,17 @@ export class FileCatalog {
   async listByAggregate(aggregateId: string): Promise<readonly CatalogEntry[]> {
     await this.#load();
     return [...this.#entries.values()].filter((entry) => entry.aggregateId === aggregateId);
+  }
+
+  async listingFingerprint(listingId: string): Promise<string | undefined> {
+    await this.#load();
+    return this.#fingerprints.get(listingId);
+  }
+
+  async rememberListingFingerprint(listingId: string, fingerprint: string): Promise<void> {
+    await this.#load();
+    this.#fingerprints.set(listingId, fingerprint);
+    await this.#save();
   }
 
   async replaceListing(aggregateId: string, entries: readonly CatalogEntry[]): Promise<void> {
@@ -281,7 +419,6 @@ export class FileCatalog {
         this.#entries.set(entry.inventoryItemId, entry);
       }
     }
-    await mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
-    await atomicWrite(this.#file, `${JSON.stringify({ entries: [...this.#entries.values()] })}\n`);
+    await this.#save();
   }
 }

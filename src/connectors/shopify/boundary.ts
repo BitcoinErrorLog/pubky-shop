@@ -15,7 +15,7 @@ export const LIVE_SHOPIFY_BOUNDARY = Object.freeze({
   multiLocationSum: false,
   perVariantStockAuthority: false,
   automaticRevisionRecompute: false,
-  homeserverMediaPutOnCliSession: false,
+  homeserverMediaPutOnCliSession: true,
 });
 
 export const LIVE_PROOF_REQUIRES = Object.freeze([

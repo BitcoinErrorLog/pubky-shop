@@ -327,23 +327,28 @@ pubky-shop auth logout --force-local
 
 ## Shopify bridge
 
-`@bitcoinerrorlog/pubky-shop/connectors/shopify` maps the published Shopify
-product CSV and the `products/update` / `inventory_levels/update` webhook
-bodies onto canonical CSV rows, then drives the existing client:
-homeserver PUT, `syncMany`, `inventory.adjust` with `external_ref.channel`
-`shopify`, seller `events`, and Pubky webhook verification. The Admin API
-client speaks GraphQL `inventorySetQuantities`. Tests run it against recorded
-responses. The live store, token, and webhook endpoint are documented in
-`connectors/shopify-bridge/BOUNDARY.md`.
+`@bitcoinerrorlog/pubky-shop/connectors/shopify` maps current and legacy
+Shopify product CSV headers, and the `products/update` /
+`inventory_levels/update` webhook bodies, onto canonical CSV rows, then
+drives the existing client: homeserver PUT, `syncMany`, `inventory.adjust`
+with `external_ref.channel` `shopify`, seller `events`, and Pubky webhook
+verification. CSV quantity columns are recorded as losses. `map-csv` does
+not write them as canonical stock. The Admin API client speaks GraphQL
+`inventorySetQuantities` with compare-quantity. Tests run it against
+recorded responses. The live store, token, and webhook endpoint are
+documented in `connectors/shopify-bridge/BOUNDARY.md`.
 
 ```sh
 shopify-bridge map-csv --input products.csv --seller <pubky> --currency USD --exponent 2 --output canonical.csv --losses losses.json
 shopify-bridge config-summary --secrets bridge-secrets.json
+shopify-bridge webhook --secrets bridge-secrets.json --receipts ./receipts --topic products/update --shop-domain shop.myshopify.com --webhook-id <id> --event-id <id> --triggered-at <iso> --hmac <base64>
 ```
 
-The secret file holds the Admin token and the Pubky session. `config-summary`
-prints the shop domain and seller pubky only. The `.` export does not import
-this Node-only entry.
+`webhook` restores the stored homeserver session (`PUBKY_SHOP_PUBKY` and the
+CLI credential store) and writes listing bytes with `storage.putBytes`.
+`--put-dir` is refused. The secret file holds the Admin token and the Pubky
+marketplace session. `config-summary` prints the shop domain and seller
+pubky only. The `.` export does not import this Node-only entry.
 
 ## Development gates
 

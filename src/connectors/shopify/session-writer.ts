@@ -1,6 +1,7 @@
 import type { StoredHomeserverSession } from "../../cli/credentials.js";
 import { restoreHomeserverSession } from "../../cli/homeserver.js";
-import type { HomeserverPath } from "../../cli/proof.js";
+import type { HomeserverSession } from "../../cli/proof.js";
+import { type HomeserverPath, requireMarketplaceCapability } from "../../cli/proof.js";
 import type { HomeserverWriter } from "./effects.js";
 import { ShopifyBridgeError } from "./errors.js";
 
@@ -44,15 +45,32 @@ export function assertNotRecoveryMaterial(value: unknown): StoredHomeserverSessi
   };
 }
 
-export async function writerFromStoredHomeserverSession(value: unknown): Promise<HomeserverWriter> {
-  const stored = assertNotRecoveryMaterial(value);
-  const session = await restoreHomeserverSession(stored);
+/** Writes listing text and media through the restored homeserver session. */
+export function writerFromHomeserverSession(session: HomeserverSession): HomeserverWriter {
+  try {
+    requireMarketplaceCapability(session);
+  } catch {
+    throw new ShopifyBridgeError("homeserver_session_missing");
+  }
   return {
     putText(filePath, body) {
       return session.putText(filePath as HomeserverPath, body);
     },
-    putBytes() {
-      return Promise.reject(new ShopifyBridgeError("homeserver_media_unsupported"));
+    putBytes(filePath, body) {
+      return session.putBytes(filePath as HomeserverPath, body);
     },
   };
+}
+
+export async function writerFromStoredHomeserverSession(value: unknown): Promise<HomeserverWriter> {
+  const stored = assertNotRecoveryMaterial(value);
+  try {
+    const session = await restoreHomeserverSession(stored);
+    return writerFromHomeserverSession(session);
+  } catch (error) {
+    if (error instanceof ShopifyBridgeError) {
+      throw error;
+    }
+    throw new ShopifyBridgeError("homeserver_session_invalid");
+  }
 }

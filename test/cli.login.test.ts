@@ -3,18 +3,17 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-
+import { HOMESERVER_CAPABILITY } from "../src/cli/config.js";
 import {
   filesystemHomeserverSessionStore,
   filesystemStore,
   homeserverSessionAccount,
 } from "../src/cli/credentials.js";
 import { decodeBase64Url32, encodeBase64Url, sha256Bytes } from "../src/cli/encoding.js";
-import { HOMESERVER_CAPABILITY } from "../src/cli/config.js";
 import { describeAuthorizationUrl } from "../src/cli/login.js";
 import { runCli } from "../src/cli/main.js";
-import { proofDocumentText } from "../src/cli/proof.js";
 import type { HomeserverSession } from "../src/cli/proof.js";
+import { proofDocumentText } from "../src/cli/proof.js";
 
 const PUBKY = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
 const FLOW_ID = "018f4f36-8d4c-7a7b-a2dd-d5ef304068ec";
@@ -32,6 +31,7 @@ function session(): HomeserverSession & { puts: string[]; deletes: string[] } {
     async putText(path, body) {
       puts.push(`${path}:${body}`);
     },
+    async putBytes() {},
     async delete(path) {
       deletes.push(path);
     },

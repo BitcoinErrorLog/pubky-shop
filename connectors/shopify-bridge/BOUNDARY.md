@@ -9,33 +9,48 @@ They are not sent to the other side: the Admin token is attached only to the
 configured `*.myshopify.com` Admin GraphQL origin, and the Pubky session is
 attached only to the configured marketplace-service origin.
 
-The bridge does not read a seller recovery file. `writerFromStoredHomeserverSession`
-accepts the CLI's stored homeserver session (`{pubky, capabilities, secret}`)
-and rejects mnemonic, seed, and recovery fields. The CLI session type can put
-listing text. It cannot put media bytes. Image bytes are written only through
-a homeserver writer that implements `putBytes`. The fixture proof uses a
-directory writer. A live homeserver media put is not claimed.
+The bridge does not read a seller recovery file. `shopify-bridge webhook`
+loads the CLI's stored homeserver session and writes listing text with
+`storage.putText` and media bytes with `storage.putBytes`. `--put-dir` is
+refused. A local directory is not a homeserver writer on this command.
 
 Stock is listing-total. Variant quantities at the single configured location
 are summed into that total. Quantities at every other location are a loss and
-are not added. The product CSV `Variant Inventory Qty` column is not
-location-scoped, so a CSV import publishes stock only after the Admin API
-returns the configured location. Outbound Pubky `inventory.adjusted` events
-call Shopify `inventorySetQuantities` only when the listing has one Shopify
-inventory item. A listing-total event for several variants is quarantined
-instead of being split.
+are not added. Product CSV quantity columns (`Inventory quantity` and
+`Variant Inventory Qty`) are not location-scoped. `map-csv` emits no
+canonical stock from them. A CSV import publishes stock only after the Admin
+API returns the configured location. Outbound Pubky `inventory.adjusted`
+events call Shopify `inventorySetQuantities` with `ignoreCompareQuantity`
+false and the catalog quantity as `compareQuantity`, and only when the
+listing has one Shopify inventory item. A Shopify quantity that does not
+match that compare value is quarantined as `shopify_quantity_conflict`. A
+listing-total event for several variants is quarantined instead of being
+split.
 
-A receipt is `(channel, shop id, external event id)` plus the payload hash.
-The same identity and hash returns the stored result. The same identity with
-a different hash is quarantined until `releaseQuarantine`. A crash after the
-effect is stored and before the checkpoint does not run the effect again. A
-crash after the plan is stored replays that plan, including the same
-`inventory.adjust` idempotency key. A `revision_conflict` or
-`idempotency_conflict` is quarantined. The bridge does not read stock again
-and invent a new delta.
+A Shopify receipt is the merchant action in `X-Shopify-Event-Id` when that
+header is present, with `X-Shopify-Webhook-Id` aliased to the same receipt.
+Without an event id, the webhook id is the receipt. The same identity and
+hash returns the stored result. The same identity with a different hash is
+quarantined until `releaseQuarantine`. CSV receipts hash that product's
+rows, excluding the unscoped quantity column, so an edit to another product
+does not change this product's hash. A crash after the remote call and
+before `markComplete` leaves the receipt at `effect-sent`. Resume reads
+Shopify available stock and does not call `inventorySetQuantities` again
+when that stock is already the planned quantity. A crash after the plan is
+stored replays that plan, including the same `inventory.adjust` idempotency
+key. A `revision_conflict` or `idempotency_conflict` is quarantined. The
+bridge does not read stock again and invent a new delta. A `sync-many` item
+404 or 409 is quarantined before adjust or checkpoint. A 408, 429, or 500
+item result is rejected and the same receipt retries.
 
-Catalog PUT writes homeserver record revision 1. A changed Shopify payload is
-quarantined rather than published as a new revision.
+Catalog PUT writes homeserver record revision 1 on the first import. A later
+delivery with the same catalog fingerprint does not PUT again. A later
+delivery whose catalog fingerprint differs is quarantined as
+`catalog_changed` and does not overwrite revision 1.
+
+Shopify webhook HMAC requires canonical Base64: a valid signature with extra
+characters does not verify. `X-Shopify-Triggered-At` outside five minutes,
+including one millisecond past the boundary, is `clock_skew`.
 
 eBay, hosted credentials, and the Shop inventory board are outside this
 bridge. Inventory Studio can call `mapShopifyProductCsv` for the same header

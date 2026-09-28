@@ -1,9 +1,8 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import path from "node:path";
-
-import type { PubkyShopClient } from "../../client.js";
+import type { PubkyShopClient, SyncManyEnvelope } from "../../client.js";
+import type { SdkResult } from "../../errors.js";
 import type { LosslessJsonObject, LosslessJsonValue } from "../../json.js";
 import { canonicalJson } from "../../json.js";
+import { classifySyncManyItem } from "../../plan.js";
 import type { ShopifyAdmin } from "./admin.js";
 import { downloadHttpsBytes } from "./download.js";
 import { ShopifyBridgeError } from "./errors.js";
@@ -18,6 +17,7 @@ import {
 import {
   applyLocationQuantities,
   canonicalRowsFor,
+  csvProductSourceHash,
   isMappedProduct,
   type MappedProduct,
   mapInventoryLevel,
@@ -61,6 +61,7 @@ export interface ShopifyWebhookHeaders {
   readonly topic: string;
   readonly shopDomain: string;
   readonly webhookId: string;
+  readonly eventId: string;
   readonly triggeredAt: string;
 }
 
@@ -74,7 +75,7 @@ export interface ApplyContext {
   readonly nowMs: number;
   readonly maxSkewMs?: number;
   readonly downloadFetch?: typeof fetch;
-  readonly crashAfterState?: "effect-planned" | "effect-complete";
+  readonly crashAfterState?: "effect-planned" | "effect-sent" | "after-remote" | "effect-complete";
 }
 
 export interface PubkyStockEvent {
@@ -110,7 +111,10 @@ function fromPlan(
   };
 }
 
-function crashIf(ctx: ApplyContext, state: "effect-planned" | "effect-complete"): void {
+function crashIf(
+  ctx: ApplyContext,
+  state: "effect-planned" | "effect-sent" | "after-remote" | "effect-complete",
+): void {
   if (ctx.crashAfterState === state) {
     throw new ShopifyBridgeError("crash_injected");
   }
@@ -263,6 +267,12 @@ async function catalogPlan(
     { ...located.product, variants: positive, losses: located.product.losses },
     images.media,
   );
+  const recordText = catalogRecordText(rows);
+  const fingerprint = payloadHash(
+    new TextEncoder().encode(
+      `${recordText}\n${images.files.map((file) => file.base64).join("\n")}`,
+    ),
+  );
   const aggregateId = listingAggregateId(ctx.secrets.sellerPubky, product.listingId);
   const current = await projectionAvailable(ctx.pubky, aggregateId);
   const target = positive.reduce((sum, variant) => sum + variant.quantity, 0);
@@ -293,7 +303,8 @@ async function catalogPlan(
     kind: "catalog",
     listingId: product.listingId,
     aggregateId,
-    recordText: catalogRecordText(rows),
+    fingerprint,
+    recordText,
     media: images.files,
     sellerPubky: ctx.secrets.sellerPubky,
     catalogVariants,
@@ -412,10 +423,104 @@ async function sendAdjust(
   return { action: "retry" };
 }
 
+function syncItemStatus(status: unknown): number | undefined {
+  if (typeof status === "number" && Number.isInteger(status)) {
+    return status;
+  }
+  if (typeof status === "bigint") {
+    return Number(status);
+  }
+  if (typeof status === "string" && /^[0-9]+$/.test(status)) {
+    return Number(status);
+  }
+  return undefined;
+}
+
+function classifySync(
+  synced: SdkResult<SyncManyEnvelope>,
+  sellerPubky: string,
+  listingId: string,
+):
+  | { readonly action: "ok" }
+  | { readonly action: "retry" | "quarantine"; readonly reason: string } {
+  if (!synced.ok) {
+    return { action: "retry", reason: "sync_item_retry" };
+  }
+  const matches = synced.value.results.filter((item) => {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return false;
+    }
+    const record = item as LosslessJsonObject;
+    return record.seller_pubky === sellerPubky && record.listing_id === listingId;
+  });
+  if (matches.length !== 1) {
+    return { action: "quarantine", reason: "sync_item_rejected" };
+  }
+  const classified = classifySyncManyItem(matches[0]);
+  if (classified.listingId !== null && classified.listingId !== listingId) {
+    return { action: "quarantine", reason: "sync_item_rejected" };
+  }
+  if (classified.ok) {
+    return { action: "ok" };
+  }
+  const status = syncItemStatus(classified.status);
+  if (
+    status === 408 ||
+    status === 429 ||
+    (status !== undefined && status >= 500 && status <= 599)
+  ) {
+    return { action: "retry", reason: "sync_item_retry" };
+  }
+  return { action: "quarantine", reason: "sync_item_rejected" };
+}
+
+async function locationAvailable(
+  ctx: ApplyContext,
+  inventoryItemId: string,
+  locationId: string,
+): Promise<number | undefined> {
+  const levels = await ctx.admin.inventoryLevels(inventoryItemId);
+  return levels.find((level) => sameShopifyId(level.locationId, locationId, "Location"))?.available;
+}
+
+async function finishRemote(
+  receipt: Receipt,
+  ctx: ApplyContext,
+  plan: PlannedEffect,
+): Promise<BridgeResult> {
+  crashIf(ctx, "after-remote");
+  const completed = await ctx.receipts.markComplete(receipt);
+  crashIf(ctx, "effect-complete");
+  await ctx.receipts.checkpoint(completed);
+  if (plan.kind === "noop") {
+    return fromPlan("ignored", plan.reason, plan);
+  }
+  return fromPlan("applied", "ok", plan);
+}
+
 async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeResult> {
   const plan = receipt.plan;
   if (plan === undefined) {
     throw new ShopifyBridgeError("receipt_conflict");
+  }
+  if (plan.kind === "catalog") {
+    const prior = await ctx.catalog.listingFingerprint(plan.listingId);
+    if (prior !== undefined && prior !== plan.fingerprint) {
+      await ctx.receipts.quarantine(receipt, "catalog_changed");
+      return fromPlan("quarantined", "catalog_changed", plan);
+    }
+    if (prior === plan.fingerprint) {
+      return finishRemote(receipt, ctx, {
+        kind: "noop",
+        reason: "catalog_unchanged",
+        losses: plan.losses,
+      });
+    }
+  }
+  let working = receipt;
+  if (working.state === "effect-planned") {
+    working = await ctx.receipts.markSent(working);
+    crashIf(ctx, "effect-sent");
   }
   if (plan.kind === "catalog") {
     for (const file of plan.media) {
@@ -429,19 +534,25 @@ async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeR
     const synced = await ctx.pubky.syncMany([
       { seller_pubky: plan.sellerPubky, listing_id: plan.listingId },
     ]);
-    if (!synced.ok) {
-      return fromPlan("rejected", "pubky_rejected", plan);
+    const item = classifySync(synced, plan.sellerPubky, plan.listingId);
+    if (item.action === "quarantine") {
+      await ctx.receipts.quarantine(working, item.reason);
+      return fromPlan("quarantined", item.reason, plan);
+    }
+    if (item.action === "retry") {
+      return fromPlan("rejected", item.reason, plan);
     }
     if (plan.adjust !== null) {
       const sent = await sendAdjust(ctx, plan.adjust);
       if (sent.action === "quarantine") {
-        await ctx.receipts.quarantine(receipt, sent.reason);
+        await ctx.receipts.quarantine(working, sent.reason);
         return fromPlan("quarantined", sent.reason, plan);
       }
       if (sent.action === "retry") {
         return fromPlan("rejected", "pubky_rejected", plan);
       }
     }
+    await ctx.catalog.rememberListingFingerprint(plan.listingId, plan.fingerprint);
     await ctx.catalog.replaceListing(
       plan.aggregateId,
       plan.catalogVariants.map((variant) => ({
@@ -454,7 +565,7 @@ async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeR
     if (plan.adjust !== null) {
       const sent = await sendAdjust(ctx, plan.adjust);
       if (sent.action === "quarantine") {
-        await ctx.receipts.quarantine(receipt, sent.reason);
+        await ctx.receipts.quarantine(working, sent.reason);
         return fromPlan("quarantined", sent.reason, plan);
       }
       if (sent.action === "retry") {
@@ -470,27 +581,41 @@ async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeR
       })),
     );
   } else if (plan.kind === "inventory-set") {
-    try {
-      await ctx.admin.inventorySet({
-        inventoryItemId: plan.inventoryItemId,
-        locationId: plan.locationId,
-        quantity: plan.quantity,
-        referenceDocumentUri: plan.referenceDocumentUri,
-      });
-    } catch (error) {
-      if (error instanceof ShopifyBridgeError && error.code === "unrecorded_shopify_call") {
-        throw error;
+    const available = await locationAvailable(ctx, plan.inventoryItemId, plan.locationId);
+    if (available !== plan.quantity) {
+      if (available !== plan.compareQuantity) {
+        await ctx.receipts.quarantine(working, "shopify_quantity_conflict");
+        return fromPlan("quarantined", "shopify_quantity_conflict", plan);
       }
-      return fromPlan("rejected", "shopify_rejected", plan);
+      try {
+        await ctx.admin.inventorySet({
+          inventoryItemId: plan.inventoryItemId,
+          locationId: plan.locationId,
+          compareQuantity: plan.compareQuantity,
+          quantity: plan.quantity,
+          referenceDocumentUri: plan.referenceDocumentUri,
+        });
+      } catch (error) {
+        if (error instanceof ShopifyBridgeError && error.code === "unrecorded_shopify_call") {
+          throw error;
+        }
+        if (error instanceof ShopifyBridgeError && error.code === "shopify_quantity_conflict") {
+          await ctx.receipts.quarantine(working, "shopify_quantity_conflict");
+          return fromPlan("quarantined", "shopify_quantity_conflict", plan);
+        }
+        return fromPlan("rejected", "shopify_rejected", plan);
+      }
+    }
+    const entries = await ctx.catalog.listByAggregate(
+      (await ctx.catalog.getByInventoryItem(plan.inventoryItemId))?.aggregateId ?? "",
+    );
+    if (entries.length === 1 && entries[0] !== undefined) {
+      await ctx.catalog.replaceListing(entries[0].aggregateId, [
+        { ...entries[0], quantity: plan.quantity },
+      ]);
     }
   }
-  const completed = await ctx.receipts.markComplete(receipt);
-  crashIf(ctx, "effect-complete");
-  await ctx.receipts.checkpoint(completed);
-  if (plan.kind === "noop") {
-    return fromPlan("ignored", plan.reason, plan);
-  }
-  return fromPlan("applied", "ok", plan);
+  return finishRemote(working, ctx, plan);
 }
 
 async function resume(
@@ -508,7 +633,7 @@ async function resume(
     await ctx.receipts.checkpoint(receipt);
     return fromPlan("replayed", "replay", receipt.plan);
   }
-  if (receipt.state === "effect-planned") {
+  if (receipt.state === "effect-planned" || receipt.state === "effect-sent") {
     return executePlan(receipt, ctx);
   }
   const planned = await build();
@@ -546,11 +671,19 @@ export async function applyShopifyWebhook(
   if (!printable(headers.webhookId, 128)) {
     return emptyResult("rejected", "webhook_id");
   }
+  const eventId = headers.eventId;
+  if (eventId !== "" && !printable(eventId, 128)) {
+    return emptyResult("rejected", "event_id");
+  }
   const hash = payloadHash(raw);
-  const receipt = await ctx.receipts.open(ctx.secrets.shopId, headers.webhookId, hash);
-  return resume(receipt, ctx, () =>
-    buildWebhookPlan(headers.topic, raw, headers.webhookId, hash, ctx),
+  const identity = eventId !== "" ? eventId : headers.webhookId;
+  const receipt = await ctx.receipts.openShopifyDelivery(
+    ctx.secrets.shopId,
+    headers.webhookId,
+    eventId,
+    hash,
   );
+  return resume(receipt, ctx, () => buildWebhookPlan(headers.topic, raw, identity, hash, ctx));
 }
 
 export async function applyShopifyProductCsv(
@@ -558,12 +691,12 @@ export async function applyShopifyProductCsv(
   ctx: ApplyContext,
 ): Promise<readonly BridgeResult[]> {
   const mapped = mapShopifyProductCsv(bytes, ctx.secrets);
-  const hash = payloadHash(bytes);
   const results: BridgeResult[] = mapped.skipped.map((skipped) =>
     emptyResult("ignored", skipped.losses[0]?.code ?? "skipped", skipped.losses),
   );
   for (const product of mapped.products) {
     const eventId = `csv:${product.handle}`;
+    const hash = csvProductSourceHash(bytes, product.handle);
     const receipt = await ctx.receipts.open(ctx.secrets.shopId, eventId, hash);
     results.push(
       await resume(receipt, ctx, async () => {
@@ -652,10 +785,16 @@ export async function applyOutboundEvent(
     if (current.available < 0n || current.available > 1_000_000_000n) {
       return emptyResult("quarantined", "quantity_not_representable");
     }
+    const locationId = shopifyGid("Location", ctx.secrets.locationId);
+    const shopifyAvailable = await locationAvailable(ctx, entry.inventoryItemId, locationId);
+    if (shopifyAvailable === undefined || shopifyAvailable !== entry.quantity) {
+      return emptyResult("quarantined", "shopify_quantity_conflict");
+    }
     return {
       kind: "inventory-set",
       inventoryItemId: entry.inventoryItemId,
-      locationId: shopifyGid("Location", ctx.secrets.locationId),
+      locationId,
+      compareQuantity: entry.quantity,
       quantity: Number(current.available),
       referenceDocumentUri: `https://pubky.app/marketplace/events/${event.id}`,
       losses: [],
@@ -779,33 +918,4 @@ export function renderBridgeResult(
   secrets: BridgeSecrets,
 ): string {
   return redact(`${JSON.stringify(result)}\n`, secretValues(secrets));
-}
-
-export async function directoryHomeserverWriter(directory: string): Promise<HomeserverWriter> {
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const resolve = (filePath: string): string => {
-    const relative = filePath.replace(/^\/+/, "");
-    if (relative === "" || relative.split("/").some((part) => part === ".." || part === "")) {
-      throw new ShopifyBridgeError("homeserver_path");
-    }
-    const target = path.resolve(directory, relative);
-    const root = path.resolve(directory);
-    if (!target.startsWith(`${root}${path.sep}`)) {
-      throw new ShopifyBridgeError("homeserver_path");
-    }
-    return target;
-  };
-  return {
-    async putText(filePath, body) {
-      const target = resolve(filePath);
-      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      await writeFile(target, body, { mode: 0o600 });
-    },
-    async putBytes(filePath, body, contentType) {
-      const target = resolve(filePath);
-      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      await writeFile(target, body, { mode: 0o600 });
-      await writeFile(`${target}.content-type`, contentType, { mode: 0o600 });
-    },
-  };
 }

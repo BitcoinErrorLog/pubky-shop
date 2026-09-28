@@ -31,7 +31,6 @@ export {
   applyPubkyWebhook,
   applyShopifyProductCsv,
   applyShopifyWebhook,
-  directoryHomeserverWriter,
   pullInventoryEvents,
   renderBridgeResult,
 } from "./effects.js";
@@ -52,6 +51,7 @@ export type {
 export {
   applyLocationQuantities,
   canonicalRowsFor,
+  csvProductSourceHash,
   isMappedProduct,
   mapInventoryLevel,
   mapProductUpdate,
