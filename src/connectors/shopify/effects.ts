@@ -33,7 +33,12 @@ import type {
   Receipt,
   StoredAdjust,
 } from "./receipts.js";
-import { catalogRecordText, listingRecordPath, mediaRecordPath } from "./record.js";
+import {
+  catalogRecordText,
+  listingRecordPath,
+  mediaRecordPath,
+  stockNeutralCatalogFingerprint,
+} from "./record.js";
 import { redact } from "./redact.js";
 import { type BridgeSecrets, secretValues } from "./secrets.js";
 
@@ -75,7 +80,12 @@ export interface ApplyContext {
   readonly nowMs: number;
   readonly maxSkewMs?: number;
   readonly downloadFetch?: typeof fetch;
-  readonly crashAfterState?: "effect-planned" | "effect-sent" | "after-remote" | "effect-complete";
+  readonly crashAfterState?:
+    | "effect-planned"
+    | "effect-sent"
+    | "after-remote"
+    | "effect-complete"
+    | "catalog-fingerprint";
 }
 
 export interface PubkyStockEvent {
@@ -268,10 +278,9 @@ async function catalogPlan(
     images.media,
   );
   const recordText = catalogRecordText(rows);
-  const fingerprint = payloadHash(
-    new TextEncoder().encode(
-      `${recordText}\n${images.files.map((file) => file.base64).join("\n")}`,
-    ),
+  const fingerprint = stockNeutralCatalogFingerprint(
+    recordText,
+    images.files.map((file) => file.base64),
   );
   const aggregateId = listingAggregateId(ctx.secrets.sellerPubky, product.listingId);
   const current = await projectionAvailable(ctx.pubky, aggregateId);
@@ -498,6 +507,36 @@ async function finishRemote(
   return fromPlan("applied", "ok", plan);
 }
 
+function catalogEntries(plan: Extract<PlannedEffect, { kind: "catalog" }>) {
+  return plan.catalogVariants.map((variant) => ({
+    ...variant,
+    listingId: plan.listingId,
+    aggregateId: plan.aggregateId,
+  }));
+}
+
+async function catalogCovers(
+  ctx: ApplyContext,
+  plan: Extract<PlannedEffect, { kind: "catalog" }>,
+): Promise<boolean> {
+  const entries = await ctx.catalog.listByAggregate(plan.aggregateId);
+  return plan.catalogVariants.every((variant) =>
+    entries.some((entry) => entry.inventoryItemId === variant.inventoryItemId),
+  );
+}
+
+async function commitCatalog(
+  ctx: ApplyContext,
+  plan: Extract<PlannedEffect, { kind: "catalog" }>,
+): Promise<void> {
+  await ctx.catalog.commitListing(
+    plan.listingId,
+    plan.fingerprint,
+    plan.aggregateId,
+    catalogEntries(plan),
+  );
+}
+
 async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeResult> {
   const plan = receipt.plan;
   if (plan === undefined) {
@@ -510,6 +549,9 @@ async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeR
       return fromPlan("quarantined", "catalog_changed", plan);
     }
     if (prior === plan.fingerprint) {
+      if (!(await catalogCovers(ctx, plan))) {
+        await commitCatalog(ctx, plan);
+      }
       return finishRemote(receipt, ctx, {
         kind: "noop",
         reason: "catalog_unchanged",
@@ -552,15 +594,11 @@ async function executePlan(receipt: Receipt, ctx: ApplyContext): Promise<BridgeR
         return fromPlan("rejected", "pubky_rejected", plan);
       }
     }
-    await ctx.catalog.rememberListingFingerprint(plan.listingId, plan.fingerprint);
-    await ctx.catalog.replaceListing(
-      plan.aggregateId,
-      plan.catalogVariants.map((variant) => ({
-        ...variant,
-        listingId: plan.listingId,
-        aggregateId: plan.aggregateId,
-      })),
-    );
+    if (ctx.crashAfterState === "catalog-fingerprint") {
+      await ctx.catalog.rememberListingFingerprint(plan.listingId, plan.fingerprint);
+      throw new ShopifyBridgeError("crash_injected");
+    }
+    await commitCatalog(ctx, plan);
   } else if (plan.kind === "stock") {
     if (plan.adjust !== null) {
       const sent = await sendAdjust(ctx, plan.adjust);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -516,7 +516,8 @@ test("homeserver writer puts bytes on the session and the command does not use a
     },
     async delete() {},
   };
-  assert.equal(LIVE_SHOPIFY_BOUNDARY.homeserverMediaPutOnCliSession, false);
+  assert.equal(LIVE_SHOPIFY_BOUNDARY.homeserverMediaPutOnCliSession, true);
+  assert.equal(LIVE_SHOPIFY_BOUNDARY.liveHomeserverMediaPut, false);
   const writer = writerFromHomeserverSession(session);
   await writer.putBytes(
     "/pub/pubky.app/marketplace/v1/listings/night-boots/media/m1",
@@ -628,6 +629,191 @@ test("homeserver writer puts bytes on the session and the command does not use a
   assert.equal(mismatch.stdout.includes("not-a-real-session-secret"), false);
 });
 
+test("a crash after the fingerprint write still restores catalog entries", async () => {
+  const body = productBody("Night Boots");
+  const directory = await scratch();
+  let quantity = 4;
+  const fetchImpl: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("myshopify.com")) {
+      return levels(quantity);
+    }
+    if (url.includes("/v1/listings/sync-many")) {
+      return json(syncItem(207), 207);
+    }
+    return json({ ok: false, error: { code: "listing_not_found", message: "missing" } }, 404);
+  };
+  const headersFor = headers(
+    body,
+    "products/update",
+    "00000000-0000-4000-8000-0000000000e1",
+    "evt-torn",
+  );
+  await assert.rejects(
+    () =>
+      applyShopifyWebhook(
+        body,
+        headersFor,
+        context(directory, fetchImpl, writer(), "catalog-fingerprint"),
+      ),
+    (error: unknown) => error instanceof ShopifyBridgeError && error.code === "crash_injected",
+  );
+  const torn = new FileCatalog(directory);
+  assert.equal((await torn.listByAggregate(`listing:${SELLER_PUBKY}_night-boots`)).length, 0);
+  assert.equal((await torn.listingFingerprint("night-boots")) !== undefined, true);
+  const resumed = await applyShopifyWebhook(
+    body,
+    headersFor,
+    context(directory, fetchImpl, writer()),
+  );
+  assert.equal(resumed.reason, "catalog_unchanged");
+  const restored = await new FileCatalog(directory).listByAggregate(
+    `listing:${SELLER_PUBKY}_night-boots`,
+  );
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0]?.inventoryItemId, ITEM);
+  quantity = 6;
+  const level = new TextEncoder().encode(
+    JSON.stringify({ inventory_item_id: 808950810, location_id: Number(LOCATION), available: 6 }),
+  );
+  const adjusted = await applyShopifyWebhook(
+    level,
+    headers(level, "inventory_levels/update", "00000000-0000-4000-8000-0000000000e2", "evt-level"),
+    context(
+      directory,
+      async (input) => {
+        const url = String(input);
+        if (url.includes("/v1/inventory/listings/")) {
+          return projection(4);
+        }
+        if (url.includes("/v1/inventory/adjust")) {
+          return adjustment(6, 3);
+        }
+        return json({ ok: false, error: { code: "listing_not_found", message: "missing" } }, 404);
+      },
+      writer(),
+    ),
+  );
+  assert.equal(adjusted.outcome, "applied");
+  assert.notEqual(adjusted.reason, "unknown_inventory_item");
+});
+
+test("a stock change does not quarantine an unchanged product", async () => {
+  const body = productBody("Night Boots");
+  const directory = await scratch();
+  let quantity = 4;
+  let project = false;
+  let puts = 0;
+  const fetchImpl: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("myshopify.com")) {
+      return levels(quantity);
+    }
+    if (url.includes("/v1/listings/sync-many")) {
+      return json(syncItem(207), 207);
+    }
+    if (url.includes("/v1/inventory/listings/")) {
+      if (!project) {
+        return json({ ok: false, error: { code: "listing_not_found", message: "missing" } }, 404);
+      }
+      return projection(4);
+    }
+    if (url.includes("/v1/inventory/adjust")) {
+      return adjustment(9, 3);
+    }
+    return json({ ok: false, error: { code: "invalid_request", message: "no" } }, 404);
+  };
+  const ctx = context(directory, fetchImpl, {
+    async putText() {
+      puts += 1;
+    },
+    async putBytes() {},
+  });
+  const imported = await applyShopifyWebhook(
+    body,
+    headers(body, "products/update", "00000000-0000-4000-8000-0000000000f1", "evt-stock-import"),
+    ctx,
+  );
+  assert.equal(imported.outcome, "applied");
+  project = true;
+  quantity = 9;
+  const level = new TextEncoder().encode(
+    JSON.stringify({ inventory_item_id: 808950810, location_id: Number(LOCATION), available: 9 }),
+  );
+  const stock = await applyShopifyWebhook(
+    level,
+    headers(level, "inventory_levels/update", "00000000-0000-4000-8000-0000000000f2", "evt-stock"),
+    ctx,
+  );
+  assert.equal(stock.outcome, "applied");
+  const again = await applyShopifyWebhook(
+    body,
+    headers(body, "products/update", "00000000-0000-4000-8000-0000000000f3", "evt-stock-same"),
+    ctx,
+  );
+  assert.equal(again.outcome, "ignored");
+  assert.equal(again.reason, "catalog_unchanged");
+  assert.equal(puts, 1);
+});
+
+test("webhook reads the CLI config directory, not the working directory", async () => {
+  const directory = await scratch();
+  const home = path.join(directory, "home");
+  const config = path.join(home, ".config", "pubky-shop");
+  const work = path.join(directory, "work");
+  await mkdir(work, { recursive: true });
+  await writeBridgeSecrets(path.join(directory, "secrets.json"), secrets());
+  const session = {
+    pubky: SELLER_PUBKY,
+    secret: "not-a-real-session-secret",
+    capabilities: ["/:rw"],
+  };
+  await filesystemHomeserverSessionStore(path.join(config, "credentials")).put(
+    "https://inventory.example",
+    session,
+  );
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await writeFile(
+    path.join(
+      config,
+      `homeserver-session-${Buffer.from("https://inventory.example").toString("hex")}.json`,
+    ),
+    `${JSON.stringify({ origin: "https://inventory.example", pubky: SELLER_PUBKY })}\n`,
+    { mode: 0o600 },
+  );
+  const fakeBin = path.join(directory, "bin");
+  await mkdir(fakeBin, { recursive: true });
+  const security = path.join(fakeBin, "security");
+  await writeFile(security, `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(session)}'\n`, {
+    mode: 0o700,
+  });
+  await chmod(security, 0o700);
+  const bin = fileURLToPath(new URL("../src/connectors/shopify/bin.js", import.meta.url));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
+  delete env.PUBKY_SHOP_CREDENTIAL_DIR;
+  delete env.PUBKY_SHOP_PUBKY;
+  delete env.XDG_CONFIG_HOME;
+  const run = spawnSync(
+    process.execPath,
+    [
+      bin,
+      "webhook",
+      "--secrets",
+      path.join(directory, "secrets.json"),
+      "--receipts",
+      path.join(directory, "receipts"),
+    ],
+    { encoding: "utf8", input: "", cwd: work, env },
+  );
+  assert.equal(run.stdout.includes("homeserver_session_missing"), false, run.stdout);
+  assert.equal(run.stdout.includes("homeserver_session_invalid"), true, run.stdout);
+  assert.equal(run.stdout.includes("not-a-real-session-secret"), false);
+});
+
 function levels(quantity: number): Response {
   return json({
     data: {
@@ -656,6 +842,20 @@ function projection(available: number): Response {
     listing_id: "night-boots",
     server_revision: 2,
     stock: { authority: "listing_total", available, reserved: 0, sold: 0, total: available },
+  });
+}
+
+function adjustment(available: number, revision: number): Response {
+  return json({
+    ok: true,
+    schema_version: 1,
+    result: {
+      aggregate_id: `listing:${SELLER_PUBKY}_night-boots`,
+      event_id: "00000000-0000-4000-8000-000000000002",
+      listing_id: "night-boots",
+      server_revision: revision,
+      stock: { authority: "listing_total", available, reserved: 0, sold: 0, total: available },
+    },
   });
 }
 

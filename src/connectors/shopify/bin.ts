@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from "node:fs/promises";
 import { argv, exit, stdin, stdout } from "node:process";
+import { configDir } from "../../cli/config.js";
 import { homeserverSessionStoreFor, loadStoredHomeserverSession } from "../../cli/credentials.js";
+import { CliError } from "../../cli/exit.js";
 import { canonicalPubky } from "../../cli/proof.js";
 import { PubkyShopClient } from "../../client.js";
 import { exportCanonicalCsv } from "../../csv.js";
@@ -104,8 +106,9 @@ async function webhook(): Promise<number> {
     return 2;
   }
   const secrets = await loadBridgeSecrets(secretsFile);
+  const credentialDir = process.env.PUBKY_SHOP_CREDENTIAL_DIR?.trim();
   const stored = await loadStoredHomeserverSession(
-    homeserverSessionStoreFor(process.env, process.cwd()),
+    homeserverSessionStoreFor(process.env, credentialDir || configDir(process.env)),
     secrets.serviceUrl,
     process.env,
   );
@@ -169,7 +172,9 @@ run()
   })
   .catch((error: unknown) => {
     const code =
-      error instanceof ShopifyBridgeError || error instanceof PubkyShopError
+      error instanceof ShopifyBridgeError ||
+      error instanceof PubkyShopError ||
+      error instanceof CliError
         ? error.message
         : "failed";
     writeOut(`${code}\n`, []);

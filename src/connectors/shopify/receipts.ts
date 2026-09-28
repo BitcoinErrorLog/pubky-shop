@@ -407,6 +407,28 @@ export class FileCatalog {
     await this.#save();
   }
 
+  /** Fingerprint and entries share one catalog file write. */
+  async commitListing(
+    listingId: string,
+    fingerprint: string,
+    aggregateId: string,
+    entries: readonly CatalogEntry[],
+  ): Promise<void> {
+    await this.#load();
+    this.#fingerprints.set(listingId, fingerprint);
+    for (const [key, entry] of this.#entries) {
+      if (entry.aggregateId === aggregateId) {
+        this.#entries.delete(key);
+      }
+    }
+    for (const entry of entries) {
+      if (entry.inventoryItemId !== "") {
+        this.#entries.set(entry.inventoryItemId, entry);
+      }
+    }
+    await this.#save();
+  }
+
   async replaceListing(aggregateId: string, entries: readonly CatalogEntry[]): Promise<void> {
     await this.#load();
     for (const [key, entry] of this.#entries) {

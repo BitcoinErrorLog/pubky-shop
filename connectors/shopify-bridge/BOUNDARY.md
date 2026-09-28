@@ -10,10 +10,14 @@ configured `*.myshopify.com` Admin GraphQL origin, and the Pubky session is
 attached only to the configured marketplace-service origin.
 
 The bridge does not read a seller recovery file. `shopify-bridge webhook`
-loads the CLI's stored homeserver session only when that session's pubky is
-the seller pubky in the secret file, then writes listing text with
-`storage.putText` and media bytes with `storage.putBytes`. A homeserver
-accepting those bytes is not part of this fixture gate.
+loads the CLI's stored homeserver session from the same config directory as
+`pubky-shop auth login` (`XDG_CONFIG_HOME/pubky-shop` or
+`~/.config/pubky-shop`), and only when that session's pubky is the seller
+pubky in the secret file. It writes listing text with `storage.putText` and
+media bytes with `storage.putBytes`. That media path is a capability of the
+CLI session (`homeserverMediaPutOnCliSession`). A homeserver accepting those
+bytes is a separate fact (`liveHomeserverMediaPut`) and is not part of this
+fixture gate.
 `--put-dir` is refused, including when it is the last argument. A local
 directory is not a homeserver writer on this command.
 
