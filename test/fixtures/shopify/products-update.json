@@ -1,0 +1,28 @@
+{
+  "id": 788032119674292922,
+  "title": "Night Boots",
+  "body_html": "<p>Lined <b>boots</b></p>",
+  "vendor": "Acme",
+  "product_type": "Boots",
+  "handle": "night-boots",
+  "status": "active",
+  "published_at": "2026-01-01T00:00:00Z",
+  "tags": "night, leather",
+  "variants": [
+    {
+      "id": 642667041472713922,
+      "title": "M",
+      "price": "125.00",
+      "sku": "BOOT-M",
+      "option1": "M",
+      "inventory_item_id": 808950810,
+      "inventory_quantity": 19
+    }
+  ],
+  "images": [
+    {
+      "src": "https://cdn.shopify.com/s/files/shirt.png",
+      "alt": "front"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+Handle,Title,Body (HTML),Vendor,Product Category,Type,Tags,Published,Option1 Name,Option1 Value,Variant SKU,Variant Inventory Qty,Variant Price,Variant Compare At Price,Image Src,Image Alt Text,Gift Card,SEO Title,Status,Price / United States
+night-boots,Night Boots,"<p>Lined <b>boots</b></p>",Acme,Apparel > Boots,Boots,"night, leather",TRUE,Size,M,BOOT-M,12,125.00,140.00,https://cdn.shopify.com/s/files/shirt.png,front,false,SEO boots,active,130.00
+night-boots,Night Boots,"<p>Lined <b>boots</b></p>",Acme,Apparel > Boots,Boots,"night, leather",TRUE,Size,L,BOOT-L,7,125.00,140.00,,,false,SEO boots,active,130.00
+draft-hat,Draft Hat,<p>Hidden</p>,Acme,Apparel,Hats,wool,FALSE,Size,M,HAT-M,3,40.00,,,,,false,,draft,

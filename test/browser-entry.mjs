@@ -61,6 +61,13 @@ for (const file of graph) {
 assert.equal(nodeSpecifiers, 0, "browser graph must not contain node: specifiers");
 assert.equal(pubkySpecifiers, 0, "browser graph must not import @synonymdev/pubky");
 
+const mapGraph = await walkGraph(join(distRoot, "connectors/shopify/map.js"));
+for (const file of mapGraph) {
+  const source = await readFile(file, "utf8");
+  assert.equal(source.includes("node:"), false, file);
+  assert.equal(source.includes("@synonymdev/pubky"), false, file);
+}
+
 const grep = spawnSync("grep", ["-r", "node:", browserRoot], { encoding: "utf8" });
 assert.equal(grep.status, 1, "grep -r node: dist/browser must have zero hits");
 assert.equal(grep.stdout, "");

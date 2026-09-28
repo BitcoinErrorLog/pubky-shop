@@ -11,6 +11,7 @@ export type HomeserverSession = {
   readonly pubky: string;
   readonly capabilities: readonly string[];
   putText(path: HomeserverPath, body: string): Promise<void>;
+  putBytes(path: HomeserverPath, body: Uint8Array): Promise<void>;
   delete(path: HomeserverPath): Promise<void>;
 };
 

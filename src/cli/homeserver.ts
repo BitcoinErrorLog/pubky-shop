@@ -27,6 +27,9 @@ export function wrapSession(session: Session): HomeserverSession {
     async putText(path, body) {
       await session.storage.putText(path, body);
     },
+    async putBytes(path, body) {
+      await session.storage.putBytes(path, body);
+    },
     async delete(path) {
       await session.storage.delete(path);
     },
